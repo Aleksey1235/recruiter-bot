@@ -9,6 +9,7 @@ import config
 from database.db import db
 from services.finance_service import reconcile_all
 from utils.checks import is_admin
+from utils.time_utils import local_now, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,41 @@ class Admin(commands.Cog):
         finally:
             if path and os.path.exists(path):
                 os.remove(path)
+
+    @admin.sub_command(name="время", description="Показать время и часовой пояс, которые использует бот")
+    async def time_info(self, inter):
+        now = local_now()
+        utc = utc_now()
+        embed = disnake.Embed(title="🕐 ВРЕМЯ БОТА", color=disnake.Color.blue())
+        embed.add_field(name="TIMEZONE", value=f"`{config.TIMEZONE}`", inline=False)
+        embed.add_field(name="Время бота", value=now.strftime("%d.%m.%Y %H:%M:%S"), inline=True)
+        embed.add_field(name="UTC", value=utc.strftime("%d.%m.%Y %H:%M:%S"), inline=True)
+        embed.add_field(name="База", value=f"`{config.DATABASE_PATH}`", inline=False)
+        await inter.response.send_message(embed=embed, ephemeral=True)
+
+    @admin.sub_command(name="уведомления", description="Показать последние попытки отправки уведомлений")
+    async def notifications(self, inter, количество: int = 10):
+        await inter.response.defer(ephemeral=True)
+        limit = max(1, min(int(количество), 20))
+        rows = await db.fetchall(
+            "SELECT * FROM notifications ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        embed = disnake.Embed(title="🔔 ДИАГНОСТИКА УВЕДОМЛЕНИЙ", color=disnake.Color.blue())
+        if not rows:
+            embed.description = "Записей уведомлений пока нет. Напоминания создаются только для рекрутеров, которые записались на смену."
+        for row in rows:
+            error = (row["last_error"] or "—")[:180]
+            embed.add_field(
+                name=f"#{row['id']} | {row['type']} | {row['status']}",
+                value=(
+                    f"Пользователь: <@{row['user_id']}>\n"
+                    f"Объект: {row['object_type']} #{row['object_id']}\n"
+                    f"Попыток: {row['attempts']} | Ошибка: {error}"
+                ),
+                inline=False,
+            )
+        await inter.edit_original_response(embed=embed)
 
     @admin.sub_command(name="здоровье", description="Проверить состояние основных компонентов")
     async def health(self, inter):
@@ -206,6 +242,7 @@ class Admin(commands.Cog):
             embed.add_field(name=name, value="✅ OK" if ok else "❌ Ошибка", inline=True)
         if not all(ok for _, ok in checks):
             embed.color = disnake.Color.red()
+        embed.set_footer(text=f"TIMEZONE={config.TIMEZONE} | Время бота: {local_now().strftime('%d.%m.%Y %H:%M:%S')}")
         await inter.edit_original_response(embed=embed)
 
 

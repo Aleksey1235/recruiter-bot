@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import disnake
 from disnake.ext import commands
@@ -15,13 +15,21 @@ from utils.time_utils import local_now, parse_db
 logger = logging.getLogger(__name__)
 
 
-def build_shift_view(shift_id: int):
+def build_shift_view(shift_id: int, can_take: bool = True):
     view = disnake.ui.View(timeout=None)
     view.add_item(
         disnake.ui.Button(
             label="Взять смену",
             style=disnake.ButtonStyle.green,
             custom_id=f"shift:take:{shift_id}",
+            disabled=not can_take,
+        )
+    )
+    view.add_item(
+        disnake.ui.Button(
+            label="Выйти со смены",
+            style=disnake.ButtonStyle.danger,
+            custom_id=f"shift:leave:{shift_id}",
         )
     )
     return view
@@ -261,7 +269,11 @@ async def update_shift_message(guild, shift_id: int):
         return
     members = await db.fetchall("SELECT * FROM shift_members WHERE shift_id=? ORDER BY id", (shift_id,))
     embed = EmbedGenerator.create_shift_embed(shift, members)
-    view = build_shift_view(shift_id) if shift["status"] in ("open", "booked") and shift["slots"] > 0 else None
+    view = (
+        build_shift_view(shift_id, can_take=shift["slots"] > 0)
+        if shift["status"] in ("open", "booked")
+        else None
+    )
 
     message = None
     if shift["message_id"]:
@@ -310,6 +322,21 @@ class Shifts(commands.Cog):
             except (ValueError, IndexError, AttributeError):
                 return await inter.response.send_message("❌ Не удалось определить ID смены.", ephemeral=True)
             return await inter.response.send_modal(TakeShiftModal(shift_id))
+
+        if custom_id.startswith("shift:leave:"):
+            if not is_recruiter_or_higher(inter.author):
+                return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
+            try:
+                shift_id = int(custom_id.rsplit(":", 1)[1])
+                left_shift_id = await shift_service.leave_shift(inter.author.id, shift_id)
+            except (ValueError, UserFacingError) as exc:
+                return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+            await inter.response.send_message(
+                f"✅ Вы вышли со смены **#{left_shift_id}**. Место снова свободно.",
+                ephemeral=True,
+            )
+            await update_shift_message(inter.guild, left_shift_id)
+            return
 
         if custom_id.startswith("report:approve:") or custom_id == "approve_report":
             if not is_senior_or_admin(inter.author):
@@ -364,6 +391,10 @@ class Shifts(commands.Cog):
         try:
             start = datetime.strptime(f"{дата} {начало}", "%d.%m.%Y %H:%M")
             end = datetime.strptime(f"{дата} {конец}", "%d.%m.%Y %H:%M")
+            # Если конец по часам раньше/равен началу, считаем, что смена
+            # заканчивается на следующие сутки (например 23:50–00:10).
+            if end <= start:
+                end += timedelta(days=1)
         except ValueError:
             return await inter.edit_original_response(
                 content="❌ Формат: `дата: 18.08.2026`, `начало: 18:00`, `конец: 20:00`."
@@ -389,6 +420,17 @@ class Shifts(commands.Cog):
         )
         await shift_service.set_shift_message_id(shift_id, message.id)
         await inter.edit_original_response(content=f"✅ Смена **#{shift_id}** создана.")
+
+    @shift.sub_command(name="выйти", description="Отказаться от забронированной смены")
+    @is_recruiter()
+    async def leave_shift_command(self, inter, смена: int = None, причина: str = "Личные обстоятельства"):
+        await inter.response.defer(ephemeral=True)
+        try:
+            shift_id = await shift_service.leave_shift(inter.author.id, смена, причина)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        await inter.edit_original_response(content=f"✅ Вы вышли со смены **#{shift_id}**. Место снова свободно.")
+        await update_shift_message(inter.guild, shift_id)
 
     @shift.sub_command(name="начать", description="Начать свою ближайшую смену")
     @is_recruiter()

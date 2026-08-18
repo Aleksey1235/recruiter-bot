@@ -178,11 +178,84 @@ async def take_shift(shift_id: int, user_id: int, username: str, static_id: str)
             member_id = cursor.lastrowid
 
         await ensure_user(user_id, username=username, static_id=static_id, tx=tx)
+        # Если рекрутер ранее выходил со смены и записался снова, старые маркеры
+        # напоминаний не должны блокировать новый цикл уведомлений.
+        await tx.execute(
+            """
+            DELETE FROM notifications
+            WHERE user_id=? AND object_type='shift' AND object_id=?
+              AND type IN ('REMINDER_30','REMINDER_10','LATE_START','SHIFT_MISSED')
+            """,
+            (user_id, shift_id),
+        )
         updated = await tx.fetchone("SELECT slots FROM shifts WHERE id=?", (shift_id,))
         new_status = "booked" if updated["slots"] <= 0 else "open"
         await tx.execute("UPDATE shifts SET status=? WHERE id=?", (new_status, shift_id))
         await log(user_id, "SHIFT_TAKEN", "shift", shift_id, f"Статик: {static_id}", tx=tx)
         return member_id
+
+
+async def leave_shift(user_id: int, shift_id: int | None = None, reason: str = "Личные обстоятельства") -> int:
+    reason = (reason or "Личные обстоятельства").strip()
+    if len(reason) > 1000:
+        raise UserFacingError("Причина не может быть длиннее 1000 символов.")
+
+    async with db.transaction() as tx:
+        if shift_id is not None:
+            member = await tx.fetchone(
+                """
+                SELECT sm.*, s.scheduled_start, s.scheduled_end
+                FROM shift_members sm
+                JOIN shifts s ON s.id=sm.shift_id
+                WHERE sm.user_id=? AND sm.shift_id=?
+                """,
+                (user_id, shift_id),
+            )
+            if not member:
+                raise UserFacingError("Вы не записаны на эту смену.")
+            if member["status"] == "active":
+                raise UserFacingError("Смена уже начата. Завершите её отчётом или обратитесь к старшему составу.")
+            if member["status"] != "booked":
+                raise UserFacingError("С этой смены уже нельзя выйти: запись больше не активна.")
+        else:
+            rows = await tx.fetchall(
+                """
+                SELECT sm.*, s.scheduled_start, s.scheduled_end
+                FROM shift_members sm
+                JOIN shifts s ON s.id=sm.shift_id
+                WHERE sm.user_id=? AND sm.status='booked'
+                ORDER BY s.scheduled_start ASC
+                LIMIT 2
+                """,
+                (user_id,),
+            )
+            if not rows:
+                active = await tx.fetchone(
+                    "SELECT id FROM shift_members WHERE user_id=? AND status='active' LIMIT 1",
+                    (user_id,),
+                )
+                if active:
+                    raise UserFacingError("У вас нет забронированной смены для выхода. Активную смену нужно завершить отчётом.")
+                raise UserFacingError("У вас нет забронированной смены.")
+            if len(rows) > 1:
+                raise UserFacingError("У вас несколько забронированных смен. Укажите параметр «смена» с ID нужной смены.")
+            member = rows[0]
+
+        cursor = await tx.execute(
+            """
+            UPDATE shift_members
+            SET status='removed', cancel_reason=?
+            WHERE id=? AND status='booked'
+            """,
+            (f"Самостоятельный выход: {reason}", member["id"]),
+        )
+        if cursor.rowcount != 1:
+            raise UserFacingError("Состояние записи изменилось. Попробуйте ещё раз.")
+
+        await tx.execute("UPDATE shifts SET slots=slots+1 WHERE id=?", (member["shift_id"],))
+        await _recalculate_shift_status(tx, member["shift_id"])
+        await log(user_id, "MEMBER_LEFT_SHIFT", "shift", member["shift_id"], reason, tx=tx)
+        return member["shift_id"]
 
 
 async def find_shift_to_start(user_id: int):

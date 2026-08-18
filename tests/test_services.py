@@ -490,3 +490,27 @@ def test_database_admin_service_safe_edits():
                 os.remove(path)
 
     asyncio.run(scenario())
+
+
+def test_recruiter_can_leave_booked_shift_and_slot_returns():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            now = datetime.now().replace(microsecond=0)
+            shift_id = await shift_service.create_shift(900, now + timedelta(minutes=20), now + timedelta(hours=1), 1, "leave test")
+            await shift_service.take_shift(shift_id, 901, "recruit", "123")
+            shift = await db.fetchone("SELECT * FROM shifts WHERE id=?", (shift_id,))
+            assert shift["slots"] == 0
+            left = await shift_service.leave_shift(901, shift_id, "дела")
+            assert left == shift_id
+            member = await db.fetchone("SELECT * FROM shift_members WHERE shift_id=? AND user_id=?", (shift_id, 901))
+            shift = await db.fetchone("SELECT * FROM shifts WHERE id=?", (shift_id,))
+            assert member["status"] == "removed"
+            assert "Самостоятельный выход" in (member["cancel_reason"] or "")
+            assert shift["slots"] == 1
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
