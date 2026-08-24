@@ -32,3 +32,13 @@ def test_database_admin_cog_is_loaded():
     assert 'name="база"' in cog_source
     assert 'name="пользователь"' in cog_source
     assert 'name="найти"' in cog_source
+
+
+def test_control_panel_cog_is_loaded():
+    main_source = (ROOT / "main.py").read_text("utf-8")
+    panel_source = (ROOT / "cogs" / "panel.py").read_text("utf-8")
+    config_source = (ROOT / "config.py").read_text("utf-8")
+    assert '"cogs.panel"' in main_source
+    assert 'custom_id="panel:shifts"' in panel_source
+    assert 'custom_id="panel:invites"' in panel_source
+    assert 'PANEL_CHANNEL_ID' in config_source

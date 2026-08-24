@@ -48,6 +48,7 @@ class Bot(commands.Bot):
             "STATS_CHANNEL_ID": config.STATS_CHANNEL_ID,
             "CONTROL_CHANNEL_ID": config.CONTROL_CHANNEL_ID,
             "LOGS_CHANNEL_ID": config.LOGS_CHANNEL_ID,
+            "PANEL_CHANNEL_ID": config.PANEL_CHANNEL_ID,
         }.items():
             if guild.get_channel(channel_id) is None:
                 logger.error("%s=%s не найден на сервере", name, channel_id)
@@ -92,6 +93,7 @@ async def main():
         "cogs.profile",
         "cogs.admin",
         "cogs.database_admin",
+        "cogs.panel",
         "cogs.tasks",
         "cogs.help",
     ]

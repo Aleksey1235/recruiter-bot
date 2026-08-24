@@ -253,7 +253,7 @@ class RejectReportModal(disnake.ui.Modal):
         embed.add_field(name="📝 Причина", value=inter.text_values["reason"], inline=False)
         await inter.response.edit_message(embed=embed, view=None)
 
-        await _notify_report_rejected(self.bot, report, inter.text_values["reason"])
+        await _notify_report_rejected(inter.bot, report, inter.text_values["reason"])
 
 
 async def update_shift_message(guild, shift_id: int):

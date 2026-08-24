@@ -46,6 +46,7 @@ REPORTS_CHANNEL_ID = _int_env("REPORTS_CHANNEL_ID")
 STATS_CHANNEL_ID = _int_env("STATS_CHANNEL_ID")
 CONTROL_CHANNEL_ID = _int_env("CONTROL_CHANNEL_ID")
 LOGS_CHANNEL_ID = _int_env("LOGS_CHANNEL_ID")
+PANEL_CHANNEL_ID = _int_env("PANEL_CHANNEL_ID", SHIFTS_CHANNEL_ID)
 
 LATE_START_WARNING_MINUTES = _int_env("LATE_START_WARNING_MINUTES", 10)
 MISS_AFTER_END_MINUTES = _int_env("MISS_AFTER_END_MINUTES", 0)
@@ -76,6 +77,7 @@ def validate_config() -> None:
         "STATS_CHANNEL_ID": STATS_CHANNEL_ID,
         "CONTROL_CHANNEL_ID": CONTROL_CHANNEL_ID,
         "LOGS_CHANNEL_ID": LOGS_CHANNEL_ID,
+        "PANEL_CHANNEL_ID": PANEL_CHANNEL_ID,
     }
     missing.extend(name for name, value in required_ids.items() if value <= 0)
 
