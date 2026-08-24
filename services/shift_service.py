@@ -45,6 +45,7 @@ async def _recalculate_shift_status(tx, shift_id: int):
     booked = counts["booked_count"] or 0
     completed = counts["completed_count"] or 0
     missed = counts["missed_count"] or 0
+    start = parse_db(shift["scheduled_start"])
     end = parse_db(shift["scheduled_end"])
     now = local_now()
 
@@ -52,14 +53,20 @@ async def _recalculate_shift_status(tx, shift_id: int):
         status = "active"
     elif booked:
         status = "booked" if (shift["slots"] or 0) <= 0 else "open"
-    elif end and now < end and (shift["slots"] or 0) > 0:
+    elif start and now < start and (shift["slots"] or 0) > 0:
+        # До официального начала свободные места всё ещё можно занимать, даже если
+        # кто-то успел начать/закончить ранний старт.
         status = "open"
     elif completed:
         status = "completed"
     elif missed:
         status = "missed"
+    elif end and now >= end:
+        status = "missed"
     else:
-        status = "completed" if end and now >= end else "open"
+        # Смена уже началась, но участников нет. Оставляем open до её окончания,
+        # однако take_shift всё равно закрывает запись после scheduled_start.
+        status = "open"
 
     await tx.execute("UPDATE shifts SET status=? WHERE id=?", (status, shift_id))
 
@@ -70,9 +77,19 @@ async def create_shift(creator_id: int, start, end, slots: int, description: str
         raise UserFacingError("Описание смены не может быть длиннее 1000 символов.")
     if slots < 1:
         raise UserFacingError("Количество мест должно быть минимум 1.")
+    if slots > config.MAX_SHIFT_SLOTS:
+        raise UserFacingError(f"Количество мест не может быть больше {config.MAX_SHIFT_SLOTS}.")
     if end <= start:
         raise UserFacingError("Время окончания должно быть позже начала.")
-    if end <= local_now():
+    duration_hours = (end - start).total_seconds() / 3600
+    if duration_hours > config.MAX_SHIFT_DURATION_HOURS:
+        raise UserFacingError(
+            f"Смена получилась длиннее {config.MAX_SHIFT_DURATION_HOURS} часов. Проверьте время начала и окончания."
+        )
+    now = local_now()
+    if start <= now:
+        raise UserFacingError("Нельзя создать смену, которая уже началась. Укажите будущее время начала.")
+    if end <= now:
         raise UserFacingError("Нельзя создать смену, которая уже закончилась.")
 
     async with db.transaction() as tx:
@@ -100,22 +117,44 @@ async def set_shift_message_id(shift_id: int, message_id: int):
     await db.execute("UPDATE shifts SET message_id=? WHERE id=?", (message_id, shift_id))
 
 
+
+
+async def set_report_message_id(report_id: int, message_id: int | None):
+    await db.execute("UPDATE shift_reports SET message_id=? WHERE id=?", (message_id, report_id))
+
 async def take_shift(shift_id: int, user_id: int, username: str, static_id: str):
     static_id = static_id.strip()
     if not static_id:
         raise UserFacingError("Укажите статик.")
-    if len(static_id) > 20:
-        raise UserFacingError("Статик слишком длинный.")
+    if len(static_id) > config.MAX_STATIC_ID_LENGTH:
+        raise UserFacingError(f"Статик не может быть длиннее {config.MAX_STATIC_ID_LENGTH} символов.")
 
     async with db.transaction() as tx:
         shift = await tx.fetchone("SELECT * FROM shifts WHERE id=?", (shift_id,))
         if not shift:
             raise UserFacingError("Смена не найдена.")
-        if shift["status"] not in ("open", "booked"):
+        if shift["status"] not in ("open", "booked", "active"):
             raise UserFacingError("Эта смена больше недоступна для записи.")
+        start = parse_db(shift["scheduled_start"])
         end = parse_db(shift["scheduled_end"])
-        if end and local_now() >= end:
+        now = local_now()
+        if end and now >= end:
             raise UserFacingError("Эта смена уже закончилась.")
+        if start and now >= start:
+            raise UserFacingError("Запись на смену закрывается в момент её начала. Попросите старший состав помочь, если нужно присоединиться позже.")
+
+        profile = await tx.fetchone("SELECT static_id FROM users WHERE discord_id=?", (user_id,))
+        if profile and profile["static_id"] and profile["static_id"] != static_id:
+            raise UserFacingError(
+                f"В вашем профиле уже указан статик {profile['static_id']}. "
+                "Чтобы не испортить данные опечаткой, изменить статик может администратор через панель базы."
+            )
+        duplicate_static = await tx.fetchone(
+            "SELECT discord_id FROM users WHERE static_id=? AND discord_id<>? LIMIT 1",
+            (static_id, user_id),
+        )
+        if duplicate_static:
+            raise UserFacingError("Этот статик уже привязан к другому профилю. Обратитесь к старшему составу.")
 
         conflict = await tx.fetchone(
             """
@@ -144,12 +183,16 @@ async def take_shift(shift_id: int, user_id: int, username: str, static_id: str)
             raise UserFacingError("Вы уже завершили эту смену.")
         if existing and existing["status"] == "missed":
             raise UserFacingError("Эта смена уже отмечена для вас как пропущенная.")
+        if existing and existing["status"] == "removed":
+            cancel_reason = (existing["cancel_reason"] or "").strip()
+            if not cancel_reason.startswith("Самостоятельный выход:"):
+                raise UserFacingError("Вы были сняты с этой смены старшим составом и не можете записаться на неё повторно самостоятельно.")
 
         cursor = await tx.execute(
             """
             UPDATE shifts
             SET slots=slots-1
-            WHERE id=? AND slots>0 AND status IN ('open', 'booked')
+            WHERE id=? AND slots>0 AND status IN ('open', 'booked', 'active')
             """,
             (shift_id,),
         )
@@ -188,9 +231,9 @@ async def take_shift(shift_id: int, user_id: int, username: str, static_id: str)
             """,
             (user_id, shift_id),
         )
-        updated = await tx.fetchone("SELECT slots FROM shifts WHERE id=?", (shift_id,))
-        new_status = "booked" if updated["slots"] <= 0 else "open"
-        await tx.execute("UPDATE shifts SET status=? WHERE id=?", (new_status, shift_id))
+        # Не затираем статус active, если один из участников уже начал работу.
+        # Свободные места и жизненный цикл смены — разные вещи.
+        await _recalculate_shift_status(tx, shift_id)
         await log(user_id, "SHIFT_TAKEN", "shift", shift_id, f"Статик: {static_id}", tx=tx)
         return member_id
 
@@ -240,6 +283,12 @@ async def leave_shift(user_id: int, shift_id: int | None = None, reason: str = "
             if len(rows) > 1:
                 raise UserFacingError("У вас несколько забронированных смен. Укажите параметр «смена» с ID нужной смены.")
             member = rows[0]
+
+        scheduled_start = parse_db(member["scheduled_start"])
+        if scheduled_start and local_now() >= scheduled_start:
+            raise UserFacingError(
+                "Смена уже началась по расписанию. Самостоятельный выход после начала недоступен; обратитесь к старшему составу."
+            )
 
         cursor = await tx.execute(
             """
@@ -458,7 +507,7 @@ async def resubmit_report(
             UPDATE shift_reports
             SET total_accepted=?, came_to_base=?, found_by_recruiter=?, comment=?,
                 status='pending', reviewed_by=NULL, reviewed_at=NULL, reject_reason=NULL,
-                created_at=CURRENT_TIMESTAMP
+                message_id=NULL, created_at=CURRENT_TIMESTAMP
             WHERE id=? AND user_id=? AND status='rejected'
             """,
             (
@@ -639,6 +688,42 @@ async def mark_missed(member_id: int):
         return member
 
 
+async def finalize_expired_shifts():
+    """Закрывает закончившиеся смены без booked/active участников.
+
+    Без этого полностью пустая смена могла навсегда остаться со статусом open,
+    потому что фоновый контроль раньше обходил только shift_members.
+    """
+    now = to_db(local_now())
+    changed = []
+    async with db.transaction() as tx:
+        rows = await tx.fetchall(
+            """
+            SELECT s.id,
+                   SUM(CASE WHEN sm.status IN ('booked','active') THEN 1 ELSE 0 END) AS live_count,
+                   SUM(CASE WHEN sm.status='completed' THEN 1 ELSE 0 END) AS completed_count,
+                   SUM(CASE WHEN sm.status='missed' THEN 1 ELSE 0 END) AS missed_count
+            FROM shifts s
+            LEFT JOIN shift_members sm ON sm.shift_id=s.id
+            WHERE s.status IN ('open','booked') AND s.scheduled_end<=?
+            GROUP BY s.id
+            """,
+            (now,),
+        )
+        for row in rows:
+            if int(row["live_count"] or 0) > 0:
+                continue
+            new_status = "completed" if int(row["completed_count"] or 0) > 0 else "missed"
+            cursor = await tx.execute(
+                "UPDATE shifts SET status=? WHERE id=? AND status IN ('open','booked')",
+                (new_status, row["id"]),
+            )
+            if cursor.rowcount == 1:
+                changed.append(int(row["id"]))
+                await log(None, "SHIFT_AUTO_FINALIZED", "shift", row["id"], new_status, tx=tx)
+    return changed
+
+
 async def get_schedule(day_start, day_end):
     return await db.fetchall(
         """
@@ -648,9 +733,10 @@ async def get_schedule(day_start, day_end):
                GROUP_CONCAT(CASE WHEN sm.status IN ('booked','active') THEN sm.user_id END) AS member_ids
         FROM shifts s
         LEFT JOIN shift_members sm ON sm.shift_id=s.id
-        WHERE s.scheduled_start BETWEEN ? AND ?
+        WHERE s.scheduled_start < ?
+          AND s.scheduled_end > ?
         GROUP BY s.id
         ORDER BY s.scheduled_start
         """,
-        (to_db(day_start), to_db(day_end)),
+        (to_db(day_end), to_db(day_start)),
     )

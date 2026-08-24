@@ -5,9 +5,9 @@ import config
 from database.db import db, log, notify
 from services.errors import UserFacingError
 from services import invite_service
-from utils.checks import is_recruiter, is_senior, is_senior_or_admin
-from utils.formatting import money
-from utils.time_utils import local_now
+from utils.checks import is_recruiter, is_senior, is_senior_or_admin, is_recruiter_or_higher
+from utils.formatting import money, normalize_amount
+from utils.time_utils import local_now, format_utc_db
 
 
 def build_invite_view(invite_id: int):
@@ -15,6 +15,62 @@ def build_invite_view(invite_id: int):
     view.add_item(disnake.ui.Button(label="✅ Принять", style=disnake.ButtonStyle.green, custom_id=f"invite:accept:{invite_id}"))
     view.add_item(disnake.ui.Button(label="❌ Отклонить", style=disnake.ButtonStyle.red, custom_id=f"invite:reject:{invite_id}"))
     return view
+
+
+async def sync_invite_review_message(guild, invite_id: int, approved: bool, reviewer_mention: str, amount: float = 0, reason: str | None = None):
+    """Обновляет публичную карточку инвайта после обработки из панели/команды."""
+    if guild is None:
+        return False
+    channel = guild.get_channel(config.REPORTS_CHANNEL_ID)
+    if not channel:
+        return False
+
+    message = None
+    invite = await db.fetchone("SELECT message_id FROM invites WHERE id=?", (invite_id,))
+    if invite and invite["message_id"]:
+        try:
+            message = await channel.fetch_message(invite["message_id"])
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Не удалось получить message_id=%s для инвайта #%s", invite["message_id"], invite_id
+            )
+
+    if message is None:
+        try:
+            async for candidate in channel.history(limit=200):
+                if not candidate.embeds or not getattr(candidate, "components", None):
+                    continue
+                source = candidate.embeds[0]
+                footer = source.footer.text if source.footer else ""
+                if footer == f"Инвайт #{invite_id}":
+                    message = candidate
+                    await invite_service.set_invite_message_id(invite_id, candidate.id)
+                    break
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Не удалось найти старую карточку инвайта #%s", invite_id)
+
+    if message is None:
+        return False
+    try:
+        embed = disnake.Embed(
+            title="✅ ИНВАЙТ ПРИНЯТ" if approved else "❌ ИНВАЙТ ОТКЛОНЁН",
+            color=disnake.Color.green() if approved else disnake.Color.red(),
+        )
+        embed.add_field(name="Инвайт", value=f"#{invite_id}", inline=True)
+        embed.add_field(name="Проверил", value=reviewer_mention, inline=True)
+        if approved and amount > 0:
+            embed.add_field(name="💰 Начислено", value=money(amount), inline=True)
+        if reason:
+            embed.add_field(name="Причина", value=reason, inline=False)
+        embed.set_footer(text=f"Инвайт #{invite_id}")
+        await message.edit(embed=embed, view=None)
+        return True
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Не удалось синхронизировать карточку инвайта #%s", invite_id)
+        return False
 
 
 def _yes_no(value: str) -> str:
@@ -44,7 +100,13 @@ class InviteModal(disnake.ui.Modal):
         )
 
     async def callback(self, inter: disnake.ModalInteraction):
+        if not is_recruiter_or_higher(inter.author):
+            return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
         await inter.response.defer(ephemeral=True)
+        if self.user.id == inter.author.id:
+            return await inter.edit_original_response(content="❌ Нельзя создать инвайт на самого себя.")
+        if getattr(self.user, "bot", False):
+            return await inter.edit_original_response(content="❌ Нельзя создать инвайт на бота.")
         try:
             checklist = {
                 "ticket": _yes_no(inter.text_values["ticket"]),
@@ -64,28 +126,40 @@ class InviteModal(disnake.ui.Modal):
         except UserFacingError as exc:
             return await inter.edit_original_response(content=f"❌ {exc}")
 
-        await inter.edit_original_response(content=f"✅ Отчёт создан. ID: **#{invite_id}**")
+        posted = False
         channel = inter.guild.get_channel(config.REPORTS_CHANNEL_ID)
         if channel:
-            embed = disnake.Embed(title="👤 НОВЫЙ ИНВАЙТ", color=disnake.Color.blue())
-            embed.add_field(name="Приглашённый", value=self.user.mention, inline=True)
-            embed.add_field(name="Статик", value=self.static_id, inline=True)
-            embed.add_field(name="Имя", value=self.full_name, inline=True)
-            embed.add_field(name="Рекрутер", value=inter.author.mention, inline=True)
-            checklist_text = (
-                f"Тикет: {'✅' if checklist['ticket']=='yes' else '❌'}\n"
-                f"Фамилия: {'✅' if checklist['last_name']=='yes' else '❌'}\n"
-                f"Организация: {'✅' if checklist['organization']=='yes' else '❌'}\n"
-                f"Фракция: {'✅' if checklist['fraction']=='yes' else '❌'}\n"
-                f"Инфо: {'✅' if checklist['info']=='yes' else '❌'}"
-            )
-            embed.add_field(name="📋 Чек-лист", value=checklist_text, inline=False)
-            embed.set_footer(text=f"Инвайт #{invite_id}")
-            await channel.send(
-                content=f"<@&{config.SENIOR_ROLE_ID}> <@&{config.ADMIN_ROLE_ID}>",
-                embed=embed,
-                view=build_invite_view(invite_id),
-            )
+            try:
+                embed = disnake.Embed(title="👤 НОВЫЙ ИНВАЙТ", color=disnake.Color.blue())
+                embed.add_field(name="Приглашённый", value=self.user.mention, inline=True)
+                embed.add_field(name="Статик", value=self.static_id, inline=True)
+                embed.add_field(name="Имя", value=self.full_name, inline=True)
+                embed.add_field(name="Рекрутер", value=inter.author.mention, inline=True)
+                checklist_text = (
+                    f"Тикет: {'✅' if checklist['ticket']=='yes' else '❌'}\n"
+                    f"Фамилия: {'✅' if checklist['last_name']=='yes' else '❌'}\n"
+                    f"Организация: {'✅' if checklist['organization']=='yes' else '❌'}\n"
+                    f"Фракция: {'✅' if checklist['fraction']=='yes' else '❌'}\n"
+                    f"Инфо: {'✅' if checklist['info']=='yes' else '❌'}"
+                )
+                embed.add_field(name="📋 Чек-лист", value=checklist_text, inline=False)
+                embed.set_footer(text=f"Инвайт #{invite_id}")
+                message = await channel.send(
+                    content=f"<@&{config.SENIOR_ROLE_ID}> <@&{config.ADMIN_ROLE_ID}>",
+                    embed=embed,
+                    view=build_invite_view(invite_id),
+                )
+                await invite_service.set_invite_message_id(invite_id, message.id)
+                posted = True
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Не удалось отправить карточку инвайта #%s", invite_id)
+        if posted:
+            text = f"✅ Отчёт создан и отправлен на проверку. ID: **#{invite_id}**"
+        else:
+            text = (f"⚠️ Инвайт **#{invite_id}** сохранён в базе, но карточку в канал отчётов отправить не удалось. "
+                    "Сообщите старшему составу.")
+        await inter.edit_original_response(content=text)
 
 
 class ApproveInviteModal(disnake.ui.Modal):
@@ -109,10 +183,10 @@ class ApproveInviteModal(disnake.ui.Modal):
         if not is_senior_or_admin(inter.author):
             return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
         try:
-            amount = float(inter.text_values["amount"].replace(",", ".").strip())
+            amount = normalize_amount(inter.text_values["amount"])
             invite, _ = await invite_service.approve_invite(self.invite_id, inter.author.id, amount)
-        except ValueError:
-            return await inter.response.send_message("❌ Введите корректное число.", ephemeral=True)
+        except ValueError as exc:
+            return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
         except UserFacingError as exc:
             return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
 
@@ -131,6 +205,7 @@ class ApproveInviteModal(disnake.ui.Modal):
         dm_sent = await notify(
             inter.bot, invite["invited_by"], "INVITE_APPROVED", "invite", self.invite_id, embed=dm
         )
+        await sync_invite_review_message(inter.guild, self.invite_id, True, inter.author.mention, amount)
         if not dm_sent:
             await inter.followup.send(
                 "⚠️ Инвайт принят, но ЛС рекрутеру не доставлено. Возможно, у пользователя закрыты личные сообщения.",
@@ -174,6 +249,7 @@ class RejectInviteModal(disnake.ui.Modal):
         dm_sent = await notify(
             inter.bot, invite["invited_by"], "INVITE_REJECTED", "invite", self.invite_id, embed=dm
         )
+        await sync_invite_review_message(inter.guild, self.invite_id, False, inter.author.mention, reason=inter.text_values["reason"])
         if not dm_sent:
             await inter.followup.send(
                 "⚠️ Инвайт отклонён, но ЛС рекрутеру не доставлено. Возможно, у пользователя закрыты личные сообщения.",
@@ -239,6 +315,10 @@ class Invites(commands.Cog):
     @invite.sub_command(name="отчёт", description="Создать отчёт о приглашённом")
     @is_recruiter()
     async def report(self, inter, пользователь: disnake.Member, статик: str, имя_фамилия: str):
+        if пользователь.id == inter.author.id:
+            return await inter.response.send_message("❌ Нельзя создать инвайт на самого себя.", ephemeral=True)
+        if пользователь.bot:
+            return await inter.response.send_message("❌ Нельзя создать инвайт на бота.", ephemeral=True)
         await inter.response.send_modal(InviteModal(пользователь, статик, имя_фамилия))
 
     @invite.sub_command(name="мои", description="Мои инвайты")
@@ -256,7 +336,7 @@ class Invites(commands.Cog):
             status = {"pending": "🟡", "accepted": "✅", "rejected": "❌"}.get(inv["status"], "❓")
             embed.add_field(
                 name=f"{status} {inv['static_id']}",
-                value=f"Имя: {inv['full_name'] or '—'}\nДата: {str(inv['created_at'])[:16]}",
+                value=f"Имя: {inv['full_name'] or '—'}\nДата: {format_utc_db(inv['created_at'])}",
                 inline=True,
             )
         await inter.edit_original_response(embed=embed)
@@ -292,6 +372,7 @@ class Invites(commands.Cog):
         if сумма > 0:
             dm.add_field(name="💰 Начислено", value=money(сумма), inline=True)
         await notify(self.bot, invite["invited_by"], "INVITE_APPROVED", "invite", инвайт, embed=dm)
+        await sync_invite_review_message(inter.guild, инвайт, True, inter.author.mention, сумма)
         await inter.edit_original_response(content=f"✅ Инвайт **#{инвайт}** принят.")
 
     @invite.sub_command(name="отклонить", description="Отклонить инвайт по ID (резервный способ)")
@@ -307,6 +388,7 @@ class Invites(commands.Cog):
         dm.add_field(name="Статик", value=invite["static_id"], inline=True)
         dm.add_field(name="Причина", value=причина, inline=False)
         await notify(self.bot, invite["invited_by"], "INVITE_REJECTED", "invite", инвайт, embed=dm)
+        await sync_invite_review_message(inter.guild, инвайт, False, inter.author.mention, reason=причина)
         await inter.edit_original_response(content=f"✅ Инвайт **#{инвайт}** отклонён.")
 
     @invite.sub_command(name="база", description="База принятых")
@@ -363,14 +445,10 @@ class Invites(commands.Cog):
         inv = await db.fetchone("SELECT * FROM invites WHERE static_id=?", (статик.strip(),))
         if not inv:
             return await inter.edit_original_response(content="❌ Не найдено.")
-        note_text = заметка.strip()
-        if not note_text:
-            return await inter.edit_original_response(content="❌ Заметка не может быть пустой.")
-        if len(note_text) > 1000:
-            return await inter.edit_original_response(content="❌ Заметка не может быть длиннее 1000 символов.")
-        new = f"\n[{local_now().strftime('%d.%m.%Y %H:%M')}] {inter.author.name}: {note_text}"
-        await db.execute("UPDATE invites SET notes=COALESCE(notes,'') || ? WHERE id=?", (new, inv["id"]))
-        await log(inter.author.id, "INVITE_NOTE", "invite", inv["id"], note_text)
+        try:
+            await invite_service.add_invite_note(inv["id"], заметка, inter.author.id, inter.author.name)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
         await inter.edit_original_response(content=f"✅ Заметка добавлена к {inv['static_id']}.")
 
 

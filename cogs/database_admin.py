@@ -5,6 +5,7 @@ import logging
 import disnake
 from disnake.ext import commands
 
+import config
 from services.database_service import (
     add_user_note,
     get_finance_operation,
@@ -20,8 +21,13 @@ from services.database_service import (
 from services.errors import UserFacingError
 from utils.checks import is_admin
 from utils.formatting import money
+from utils.time_utils import format_utc_db
 
 logger = logging.getLogger(__name__)
+
+
+def _is_admin_member(member) -> bool:
+    return config.ADMIN_ROLE_ID in {role.id for role in getattr(member, "roles", [])}
 
 
 def _clip(value, limit=1000):
@@ -127,12 +133,14 @@ class StaticModal(disnake.ui.Modal):
                     custom_id="static_id",
                     placeholder="Введите новый статик или CLEAR для очистки",
                     min_length=1,
-                    max_length=64,
+                    max_length=config.MAX_STATIC_ID_LENGTH,
                 )
             ],
         )
 
     async def callback(self, inter: disnake.ModalInteraction):
+        if not _is_admin_member(inter.author):
+            return await inter.response.send_message("❌ Доступ только администратору.", ephemeral=True)
         raw = inter.text_values["static_id"].strip()
         new_static = None if raw.upper() == "CLEAR" else raw
         try:
@@ -168,6 +176,8 @@ class NoteModal(disnake.ui.Modal):
         )
 
     async def callback(self, inter: disnake.ModalInteraction):
+        if not _is_admin_member(inter.author):
+            return await inter.response.send_message("❌ Доступ только администратору.", ephemeral=True)
         try:
             await add_user_note(
                 self.target.id,
@@ -191,6 +201,9 @@ class DatabaseUserView(disnake.ui.View):
         if inter.author.id != self.actor_id:
             await inter.response.send_message("❌ Это админ-панель другого пользователя.", ephemeral=True)
             return False
+        if not _is_admin_member(inter.author):
+            await inter.response.send_message("❌ Доступ только администратору.", ephemeral=True)
+            return False
         return True
 
     async def _edit_with_lines(self, inter, title: str, lines: list[str]):
@@ -203,7 +216,7 @@ class DatabaseUserView(disnake.ui.View):
     async def finances(self, button, inter):
         rows = await list_user_finances(self.target.id, 10)
         lines = [
-            f"`#{r['id']}` {_status(r['status'])} **{money(r['amount'])}** • `{r['type']}` • {_clip(r['reason'], 100)} • {str(r['created_at'])[:16]}"
+            f"`#{r['id']}` {_status(r['status'])} **{money(r['amount'])}** • `{r['type']}` • {_clip(r['reason'], 100)} • {format_utc_db(r['created_at'])}"
             for r in rows
         ]
         await self._edit_with_lines(inter, "💰 Последние финансовые операции", lines)
@@ -221,7 +234,7 @@ class DatabaseUserView(disnake.ui.View):
     async def reports(self, button, inter):
         rows = await list_user_reports(self.target.id, 10)
         lines = [
-            f"`#{r['id']}` смена **#{r['shift_id']}** • {_status(r['status'])} • всего **{r['total_accepted']}**, база **{r['came_to_base']}**, сам **{r['found_by_recruiter']}** • {str(r['created_at'])[:16]}"
+            f"`#{r['id']}` смена **#{r['shift_id']}** • {_status(r['status'])} • всего **{r['total_accepted']}**, база **{r['came_to_base']}**, сам **{r['found_by_recruiter']}** • {format_utc_db(r['created_at'])}"
             for r in rows
         ]
         await self._edit_with_lines(inter, "📊 Последние отчёты", lines)
@@ -230,7 +243,7 @@ class DatabaseUserView(disnake.ui.View):
     async def invites(self, button, inter):
         rows = await list_user_invites(self.target.id, 10)
         lines = [
-            f"`#{r['id']}` **{_clip(r['static_id'], 50)}** • {_status(r['status'])} • {_clip(r['full_name'], 100)} • {str(r['created_at'])[:16]}"
+            f"`#{r['id']}` **{_clip(r['static_id'], 50)}** • {_status(r['status'])} • {_clip(r['full_name'], 100)} • {format_utc_db(r['created_at'])}"
             for r in rows
         ]
         await self._edit_with_lines(inter, "👥 Последние инвайты рекрутера", lines)
@@ -239,7 +252,7 @@ class DatabaseUserView(disnake.ui.View):
     async def logs(self, button, inter):
         rows = await list_user_logs(self.target.id, 10)
         lines = [
-            f"`#{r['id']}` **{_clip(r['action'], 80)}** • {_clip(r['details'], 150)} • {str(r['created_at'])[:16]}"
+            f"`#{r['id']}` **{_clip(r['action'], 80)}** • {_clip(r['details'], 150)} • {format_utc_db(r['created_at'])}"
             for r in rows
         ]
         await self._edit_with_lines(inter, "📝 Последние действия пользователя", lines)
@@ -362,7 +375,7 @@ class DatabaseAdmin(commands.Cog):
         embed.add_field(name="Причина", value=_clip(row["reason"], 1000), inline=False)
         embed.add_field(name="Создал", value=f"<@{row['created_by']}>" if row["created_by"] else "Система", inline=True)
         embed.add_field(name="Связь со сменой", value=f"#{row['related_shift_id']}" if row["related_shift_id"] else "—", inline=True)
-        embed.add_field(name="Дата", value=str(row["created_at"]), inline=True)
+        embed.add_field(name="Дата", value=format_utc_db(row["created_at"]), inline=True)
         embed.set_footer(text="Эта команда только читает журнал. Для изменения денег используйте /финансы.")
         await inter.edit_original_response(embed=embed)
 

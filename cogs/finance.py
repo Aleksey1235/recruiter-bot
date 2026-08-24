@@ -4,8 +4,9 @@ from disnake.ext import commands
 from database.db import db, notify
 from services.errors import UserFacingError
 from services import finance_service
-from utils.checks import is_recruiter, is_senior, is_admin
+from utils.checks import is_recruiter, is_senior, is_admin, is_recruiter_or_higher
 from utils.formatting import money
+from utils.time_utils import format_utc_db
 
 
 class Finance(commands.Cog):
@@ -60,6 +61,8 @@ class Finance(commands.Cog):
     @is_senior()
     async def user_fin(self, inter, пользователь: disnake.Member):
         await inter.response.defer(ephemeral=True)
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Финансы отдела доступны только для рекрутеров и старшего состава.")
         accrued, paid, available = await finance_service.get_balance(пользователь.id)
         ops = await db.fetchall(
             "SELECT * FROM finances WHERE user_id=? ORDER BY id DESC LIMIT 10",
@@ -74,7 +77,7 @@ class Finance(commands.Cog):
                 sign = "+" if op["type"] == "salary" else "-"
                 reason = op["reason"] or ("Начисление" if op["type"] == "salary" else "Выплата")
                 embed.add_field(
-                    name=f"{str(op['created_at'])[:16]} | {'💰' if sign=='+' else '💸'}",
+                    name=f"{format_utc_db(op['created_at'])} | {'💰' if sign=='+' else '💸'}",
                     value=f"{sign}{money(op['amount'])} — {reason}",
                     inline=False,
                 )
@@ -84,6 +87,8 @@ class Finance(commands.Cog):
     @is_admin()
     async def accrue(self, inter, пользователь: disnake.Member, сумма: float, причина: str = ""):
         await inter.response.defer(ephemeral=True)
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Начислять деньги через Recruiter Bot можно только рекрутерам и старшему составу.")
         try:
             fin_id, balance = await finance_service.accrue(
                 пользователь.id, пользователь.name, сумма, причина, inter.author.id
@@ -103,6 +108,8 @@ class Finance(commands.Cog):
     @is_admin()
     async def pay(self, inter, пользователь: disnake.Member, сумма: float):
         await inter.response.defer(ephemeral=True)
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Выплаты через Recruiter Bot доступны только рекрутерам и старшему составу.")
         try:
             fin_id, balance = await finance_service.pay(
                 пользователь.id, пользователь.name, сумма, inter.author.id

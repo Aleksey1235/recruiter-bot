@@ -1,11 +1,12 @@
 import disnake
 from disnake.ext import commands
 
-from database.db import db, ensure_user, log
+from database.db import db
 from services.finance_service import get_balance
-from utils.checks import is_recruiter, is_senior, is_senior_or_admin
+from services import database_service
+from services.errors import UserFacingError
+from utils.checks import is_recruiter, is_senior, is_senior_or_admin, is_recruiter_or_higher
 from utils.formatting import money
-from utils.time_utils import local_now
 
 
 class Profile(commands.Cog):
@@ -21,6 +22,8 @@ class Profile(commands.Cog):
     async def profile(self, inter, пользователь: disnake.Member = None):
         await inter.response.defer(ephemeral=True)
         target = пользователь or inter.author
+        if пользователь is not None and not is_recruiter_or_higher(target):
+            return await inter.edit_original_response(content="❌ Выбранный пользователь не является рекрутером или членом старшего состава.")
         user = await db.fetchone("SELECT * FROM users WHERE discord_id=?", (target.id,))
         if not user:
             return await inter.edit_original_response(content=f"❌ Профиль {target.display_name} не найден.")
@@ -56,20 +59,14 @@ class Profile(commands.Cog):
     @is_senior()
     async def note(self, inter, пользователь: disnake.Member, текст: str):
         await inter.response.defer(ephemeral=True)
-        text = текст.strip()
-        if not text:
-            return await inter.edit_original_response(content="❌ Заметка не может быть пустой.")
-        if len(text) > 1000:
-            return await inter.edit_original_response(content="❌ Заметка не может быть длиннее 1000 символов.")
-        stamp = local_now().strftime("%d.%m.%Y %H:%M")
-        addition = f"\n[{stamp}] {inter.author.name}: {text}"
-        async with db.transaction() as tx:
-            await ensure_user(пользователь.id, username=пользователь.name, tx=tx)
-            await tx.execute(
-                "UPDATE users SET notes=COALESCE(notes,'') || ? WHERE discord_id=?",
-                (addition, пользователь.id),
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Выбранный пользователь не является рекрутером или членом старшего состава.")
+        try:
+            await database_service.add_user_note(
+                пользователь.id, пользователь.name, текст, inter.author.id, inter.author.name
             )
-            await log(inter.author.id, "NOTE_ADD", "user", пользователь.id, text, tx=tx)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
         await inter.edit_original_response(content=f"✅ Заметка добавлена для {пользователь.mention}.")
 
 

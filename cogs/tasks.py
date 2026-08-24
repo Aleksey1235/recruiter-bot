@@ -115,8 +115,68 @@ class Tasks(commands.Cog):
             elif member["status"] == "active" and now >= end + timedelta(minutes=config.REPORT_REMINDER_AFTER_MINUTES):
                 embed = disnake.Embed(title="📋 НЕ ЗАБУДЬТЕ ЗАВЕРШИТЬ СМЕНУ", color=disnake.Color.blue())
                 embed.add_field(name="📋 Смена", value=f"#{member['shift_id']}", inline=True)
-                embed.add_field(name="ℹ️", value="Используйте `/смена завершить` и заполните отчёт.", inline=False)
+                embed.add_field(name="ℹ️", value="Откройте **панель → 🕐 Смена → ✅ Завершить** и заполните отчёт. `/смена завершить` — резервный способ.", inline=False)
                 await notify(self.bot, member["user_id"], "REPORT_REMINDER", "shift", member["shift_id"], embed=embed)
+                overdue = max(0, int((now - end).total_seconds() / 60))
+                await self._control_once(
+                    "ACTIVE_SHIFT_OVERDUE",
+                    "member",
+                    member["id"],
+                    f"🟠 <@{member['user_id']}> не завершил активную смену #{member['shift_id']} после окончания расписания "
+                    f"({overdue} мин.).\n<@&{config.SENIOR_ROLE_ID}>",
+                )
+
+        # Закрываем визуальную запись в момент официального старта. Маркер делает
+        # операцию одноразовой, но условие intentionally без окна «последние 2 минуты»:
+        # если бот был выключен во время старта, карточка догонит состояние после запуска.
+        booking_closed = await db.fetchall(
+            """
+            SELECT id FROM shifts
+            WHERE status IN ('open','booked','active')
+              AND scheduled_start<=?
+            """,
+            (to_db(now),),
+        )
+        if booking_closed:
+            from cogs.shifts import update_shift_message
+            guild = self.bot.get_guild(config.GUILD_ID)
+            for row in booking_closed:
+                shift_id = int(row["id"])
+                if not await reserve_system_marker("SHIFT_BOOKING_CLOSED", "shift", shift_id):
+                    continue
+                if guild is None:
+                    await finish_system_marker(
+                        "SHIFT_BOOKING_CLOSED", "shift", shift_id, False, "GUILD_ID not found"
+                    )
+                    continue
+                try:
+                    updated = await update_shift_message(guild, shift_id)
+                except Exception as exc:
+                    await finish_system_marker(
+                        "SHIFT_BOOKING_CLOSED", "shift", shift_id, False, str(exc)
+                    )
+                    logger.exception("Не удалось закрыть запись на карточке смены #%s", shift_id)
+                else:
+                    await finish_system_marker(
+                        "SHIFT_BOOKING_CLOSED",
+                        "shift",
+                        shift_id,
+                        bool(updated),
+                        None if updated else "shift message not found or edit failed",
+                    )
+
+        # Пустые смены раньше вообще не попадали в цикл выше и могли навсегда
+        # оставаться open после окончания. Закрываем их отдельным проходом.
+        finalized = await shift_service.finalize_expired_shifts()
+        if finalized:
+            try:
+                from cogs.shifts import update_shift_message
+                guild = self.bot.get_guild(config.GUILD_ID)
+                if guild:
+                    for shift_id in finalized:
+                        await update_shift_message(guild, shift_id)
+            except Exception:
+                logger.exception("Не удалось обновить автоматически закрытые смены")
 
     @tasks.loop(minutes=5)
     async def check_reports(self):
@@ -212,7 +272,7 @@ class Tasks(commands.Cog):
                 value=(
                     f"Начислено: {money(finance[0])}\n"
                     f"Выплачено: {money(finance[1])}\n"
-                    f"К выплате: {money(finance[2])}"
+                    f"Разница за неделю: {money(finance[2])}"
                 ),
                 inline=False,
             )

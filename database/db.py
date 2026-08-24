@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS shift_reports (
     reviewed_by INTEGER,
     reviewed_at TIMESTAMP,
     reject_reason TEXT,
+    message_id INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(member_id),
     FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE,
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS invites (
     reviewed_by INTEGER,
     reviewed_at TIMESTAMP,
     reject_reason TEXT,
+    message_id INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (status IN ('pending', 'accepted', 'rejected'))
 );
@@ -254,7 +256,7 @@ class Database:
         await self._migrate_additive_columns()
         await self._repair_notification_null_users()
         await self.db.executescript(INDEX_SQL)
-        await self.db.execute("PRAGMA user_version = 2")
+        await self.db.execute("PRAGMA user_version = 3")
         await self.db.commit()
 
     async def _backup_before_migration_if_needed(self):
@@ -264,7 +266,7 @@ class Database:
         version_cursor = await self.db.execute("PRAGMA user_version")
         version_row = await version_cursor.fetchone()
         version = int(version_row[0] if version_row else 0)
-        if version >= 2:
+        if version >= 3:
             return
 
         tables_cursor = await self.db.execute(
@@ -275,7 +277,7 @@ class Database:
             return
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{config.DATABASE_PATH}.pre_v2_{stamp}.db"
+        backup_path = f"{config.DATABASE_PATH}.pre_v3_{stamp}.db"
         target = sqlite3.connect(backup_path)
         try:
             await self.db.backup(target)
@@ -329,6 +331,7 @@ class Database:
                 "reviewed_by": "INTEGER",
                 "reviewed_at": "TIMESTAMP",
                 "reject_reason": "TEXT",
+                "message_id": "INTEGER",
                 "created_at": "TIMESTAMP",
             },
             "invites": {
@@ -346,6 +349,7 @@ class Database:
                 "reviewed_by": "INTEGER",
                 "reviewed_at": "TIMESTAMP",
                 "reject_reason": "TEXT",
+                "message_id": "INTEGER",
                 "created_at": "TIMESTAMP",
             },
             "goals": {

@@ -2,7 +2,7 @@ import disnake
 from disnake.ext import commands
 
 from services import statistics_service
-from utils.checks import is_recruiter, is_senior
+from utils.checks import is_recruiter, is_senior, is_recruiter_or_higher
 from utils.formatting import money
 
 PERIOD_CHOICES = ["всё время", "сегодня", "неделя", "месяц"]
@@ -61,7 +61,7 @@ class Statistics(commands.Cog):
         )
         embed.add_field(name="🎯 ЦЕЛИ", value=f"Активных: {data['active_goals']}", inline=True)
         embed.add_field(
-            name="💰 ФИНАНСЫ",
+            name="💰 ФИНАНСЫ (БАЛАНС ЗА ВСЁ ВРЕМЯ)",
             value=(
                 f"Начислено: {money(data['accrued'])}\n"
                 f"Выплачено: {money(data['paid'])}\n"
@@ -87,6 +87,8 @@ class Statistics(commands.Cog):
         период: str = commands.Param(choices=PERIOD_CHOICES, default="всё время"),
     ):
         await inter.response.defer(ephemeral=True)
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Выбранный пользователь не является рекрутером или членом старшего состава.")
         await inter.edit_original_response(embed=await self._build(пользователь.id, пользователь, период))
 
     @stats.sub_command(name="топ", description="Рейтинг рекрутеров")

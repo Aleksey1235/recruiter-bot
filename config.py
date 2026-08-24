@@ -31,8 +31,8 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "recruiter_bot.db").strip() or "recruiter_bot.db"
-TIMEZONE = os.getenv("TIMEZONE", "system").strip() or "system"
+DATABASE_PATH = os.getenv("DATABASE_PATH", "data/recruiter_bot.db").strip() or "data/recruiter_bot.db"
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
 AUTO_MIGRATION_BACKUP = _bool_env("AUTO_MIGRATION_BACKUP", True)
 PING_RECRUITERS_ON_SHIFT_CREATE = _bool_env("PING_RECRUITERS_ON_SHIFT_CREATE", True)
 
@@ -54,6 +54,9 @@ REPORT_REMINDER_AFTER_MINUTES = _int_env("REPORT_REMINDER_AFTER_MINUTES", 15)
 REVIEW_REMINDER_AFTER_MINUTES = _int_env("REVIEW_REMINDER_AFTER_MINUTES", 30)
 SUSPICIOUS_SHORT_MINUTES = _int_env("SUSPICIOUS_SHORT_MINUTES", 10)
 EARLY_START_MINUTES = _int_env("EARLY_START_MINUTES", 10)
+MAX_SHIFT_DURATION_HOURS = _int_env("MAX_SHIFT_DURATION_HOURS", 12)
+MAX_SHIFT_SLOTS = _int_env("MAX_SHIFT_SLOTS", 25)
+MAX_STATIC_ID_LENGTH = _int_env("MAX_STATIC_ID_LENGTH", 32)
 
 WEEKLY_REPORT_HOUR = _int_env("WEEKLY_REPORT_HOUR", 23)
 WEEKLY_REPORT_MINUTE = _int_env("WEEKLY_REPORT_MINUTE", 0)
@@ -105,6 +108,12 @@ def validate_config() -> None:
         raise ConfigError("MAX_NOTIFICATION_ATTEMPTS должен быть >= 1")
     if MAX_FINANCE_AMOUNT <= 0:
         raise ConfigError("MAX_FINANCE_AMOUNT должен быть > 0")
+    if MAX_SHIFT_DURATION_HOURS < 1:
+        raise ConfigError("MAX_SHIFT_DURATION_HOURS должен быть >= 1")
+    if MAX_SHIFT_SLOTS < 1:
+        raise ConfigError("MAX_SHIFT_SLOTS должен быть >= 1")
+    if not 1 <= MAX_STATIC_ID_LENGTH <= 100:
+        raise ConfigError("MAX_STATIC_ID_LENGTH должен быть от 1 до 100")
 
     if TIMEZONE.lower() != "system":
         try:

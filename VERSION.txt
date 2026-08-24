@@ -1,0 +1,6 @@
+Recruiter Bot — Production Final
+Build date: 2026-08-25
+Database schema: v3
+Python target: 3.11
+Timezone default: Europe/Moscow
+Test suite: 39 passed x 3 consecutive runs

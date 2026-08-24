@@ -18,6 +18,17 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
 
+def local_to_utc_naive(value: datetime) -> datetime:
+    """Преобразует локальное naive-время расписания в naive UTC для created_at."""
+    if value.tzinfo is not None:
+        aware = value
+    elif config.TIMEZONE.lower() == "system":
+        aware = value.astimezone()
+    else:
+        aware = value.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    return aware.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
 def to_db(value: datetime) -> str:
     return value.replace(microsecond=0).strftime(DB_FORMAT)
 
@@ -45,3 +56,21 @@ def period_start(period: str, now: datetime | None = None) -> datetime | None:
     if period == "месяц":
         return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return None
+
+
+def utc_db_to_local(value) -> datetime | None:
+    """Преобразует SQLite CURRENT_TIMESTAMP (naive UTC) в локальное naive-время бота."""
+    parsed = parse_db(value)
+    if parsed is None:
+        return None
+    aware_utc = parsed.replace(tzinfo=timezone.utc)
+    if config.TIMEZONE.lower() == "system":
+        local = aware_utc.astimezone()
+    else:
+        local = aware_utc.astimezone(ZoneInfo(config.TIMEZONE))
+    return local.replace(tzinfo=None, microsecond=0)
+
+
+def format_utc_db(value, fmt: str = "%d.%m.%Y %H:%M") -> str:
+    local = utc_db_to_local(value)
+    return local.strftime(fmt) if local else "—"

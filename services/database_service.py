@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import config
+
 from database.db import db, ensure_user, log
 from services.errors import UserFacingError
 from services.finance_service import get_balance
@@ -183,10 +185,17 @@ async def update_user_static(user_id: int, username: str | None, new_static: str
         new_static = new_static.strip()
         if not new_static:
             new_static = None
-        elif len(new_static) > 64:
-            raise UserFacingError("Статик не может быть длиннее 64 символов.")
+        elif len(new_static) > config.MAX_STATIC_ID_LENGTH:
+            raise UserFacingError(f"Статик не может быть длиннее {config.MAX_STATIC_ID_LENGTH} символов.")
 
     async with db.transaction() as tx:
+        if new_static:
+            duplicate = await tx.fetchone(
+                "SELECT discord_id FROM users WHERE static_id=? AND discord_id<>? LIMIT 1",
+                (new_static, user_id),
+            )
+            if duplicate:
+                raise UserFacingError("Этот статик уже привязан к другому пользователю.")
         await ensure_user(user_id, username=username, tx=tx)
         previous = await tx.fetchone("SELECT static_id FROM users WHERE discord_id=?", (user_id,))
         old_static = previous["static_id"] if previous else None

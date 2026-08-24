@@ -4,22 +4,38 @@ import config
 from database.db import db, ensure_user, log
 from services.errors import UserFacingError
 from utils.formatting import normalize_amount
+from utils.time_utils import local_now
 
 
 async def create_invite(invited_user_id: int, invited_by: int, inviter_name: str, static_id: str, full_name: str, checklist: dict):
+    if invited_user_id == invited_by:
+        raise UserFacingError("Нельзя создать инвайт на самого себя.")
     static_id = static_id.strip()
     full_name = full_name.strip()
     if not static_id:
         raise UserFacingError("Статик не может быть пустым.")
-    if len(static_id) > 32:
-        raise UserFacingError("Статик не может быть длиннее 32 символов.")
+    if len(static_id) > config.MAX_STATIC_ID_LENGTH:
+        raise UserFacingError(f"Статик не может быть длиннее {config.MAX_STATIC_ID_LENGTH} символов.")
     if not full_name:
         raise UserFacingError("Имя и фамилия не могут быть пустыми.")
     if len(full_name) > 100:
         raise UserFacingError("Имя и фамилия не могут быть длиннее 100 символов.")
 
+    allowed_checklist = {"ticket", "last_name", "organization", "fraction", "info"}
+    if set(checklist) != allowed_checklist or any(checklist[key] not in ("yes", "no") for key in allowed_checklist):
+        raise UserFacingError("Чек-лист инвайта содержит некорректные данные. Заполните его заново.")
+
     async with db.transaction() as tx:
         existing = await tx.fetchone("SELECT * FROM invites WHERE static_id=?", (static_id,))
+        by_user = await tx.fetchone(
+            "SELECT * FROM invites WHERE user_id=? AND status IN ('pending','accepted') ORDER BY id DESC LIMIT 1",
+            (invited_user_id,),
+        )
+        if by_user and (not existing or by_user["id"] != existing["id"]):
+            raise UserFacingError(
+                f"Этот Discord-пользователь уже есть в инвайтах со статиком {by_user['static_id']} "
+                f"и статусом {by_user['status']}."
+            )
         await ensure_user(invited_by, username=inviter_name, tx=tx)
 
         if existing:
@@ -36,7 +52,7 @@ async def create_invite(invited_user_id: int, invited_by: int, inviter_name: str
                 UPDATE invites
                 SET user_id=?, full_name=?, ticket=?, last_name_changed=?, organization=?,
                     fraction=?, info=?, status='pending', reviewed_by=NULL, reviewed_at=NULL,
-                    reject_reason=NULL, created_at=CURRENT_TIMESTAMP
+                    reject_reason=NULL, message_id=NULL, created_at=CURRENT_TIMESTAMP
                 WHERE id=? AND status='rejected'
                 """,
                 (
@@ -75,6 +91,11 @@ async def create_invite(invited_user_id: int, invited_by: int, inviter_name: str
         await log(invited_by, "INVITE_CREATE", "invite", invite_id, f"Статик: {static_id}", tx=tx)
         return invite_id
 
+
+
+
+async def set_invite_message_id(invite_id: int, message_id: int | None):
+    await db.execute("UPDATE invites SET message_id=? WHERE id=?", (message_id, invite_id))
 
 async def approve_invite(invite_id: int, reviewer_id: int, amount=0):
     try:
@@ -150,3 +171,23 @@ async def reject_invite(invite_id: int, reviewer_id: int, reason: str):
             raise UserFacingError("Этот инвайт уже обработан другим пользователем.")
         await log(reviewer_id, "INVITE_REJECT", "invite", invite_id, reason, tx=tx)
         return await tx.fetchone("SELECT * FROM invites WHERE id=?", (invite_id,))
+
+
+async def add_invite_note(invite_id: int, text: str, actor_id: int, actor_name: str):
+    text = text.strip()
+    if not text:
+        raise UserFacingError("Заметка не может быть пустой.")
+    if len(text) > 1000:
+        raise UserFacingError("Заметка не может быть длиннее 1000 символов.")
+    stamp = local_now().strftime("%d.%m.%Y %H:%M")
+    addition = f"\n[{stamp}] {actor_name}: {text}"
+    async with db.transaction() as tx:
+        invite = await tx.fetchone("SELECT * FROM invites WHERE id=?", (invite_id,))
+        if not invite:
+            raise UserFacingError("Инвайт не найден.")
+        notes = (invite["notes"] or "") + addition
+        if len(notes) > 20_000:
+            notes = notes[-20_000:]
+        await tx.execute("UPDATE invites SET notes=? WHERE id=?", (notes, invite_id))
+        await log(actor_id, "INVITE_NOTE", "invite", invite_id, text, tx=tx)
+    return notes

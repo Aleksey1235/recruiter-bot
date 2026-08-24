@@ -1,9 +1,10 @@
 import disnake
 from disnake.ext import commands
 
-from database.db import db, log, notify
+from database.db import db, notify
 from services import goal_service
-from utils.checks import is_recruiter, is_senior
+from services.errors import UserFacingError
+from utils.checks import is_recruiter, is_senior, is_recruiter_or_higher
 
 TYPE_LABELS = {"люди": "👥 Люди", "смены": "📋 Смены", "часы": "⏱ Часы"}
 PERIOD_LABELS = {"день": "за сегодня", "неделя": "за неделю", "месяц": "за месяц"}
@@ -28,30 +29,14 @@ class Goals(commands.Cog):
         период: str = commands.Param(choices=["день", "неделя", "месяц"], default="неделя"),
     ):
         await inter.response.defer(ephemeral=True)
-        if значение <= 0:
-            return await inter.edit_original_response(content="❌ Значение цели должно быть больше 0.")
-
-        async with db.transaction() as tx:
-            await tx.execute(
-                "UPDATE goals SET status='deleted' WHERE user_id=? AND type=? AND status='active'",
-                (пользователь.id, тип),
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Цели можно ставить только рекрутерам и старшему составу.")
+        try:
+            goal_id = await goal_service.set_goal(
+                пользователь.id, пользователь.name, тип, значение, период, inter.author.id
             )
-            cursor = await tx.execute(
-                """
-                INSERT INTO goals (user_id, type, target_value, period, created_by)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (пользователь.id, тип, значение, период, inter.author.id),
-            )
-            goal_id = cursor.lastrowid
-            await log(
-                inter.author.id,
-                "GOAL_SET",
-                "goal",
-                goal_id,
-                f"user={пользователь.id}; {тип}={значение}; period={период}",
-                tx=tx,
-            )
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
 
         dm = disnake.Embed(title="🎯 ВАМ ПОСТАВЛЕНА НОВАЯ ЦЕЛЬ", color=disnake.Color.blue())
         dm.add_field(name="Цель", value=f"{TYPE_LABELS[тип]}: {значение}", inline=True)
@@ -94,6 +79,8 @@ class Goals(commands.Cog):
     @is_senior()
     async def user_goals(self, inter, пользователь: disnake.Member):
         await inter.response.defer(ephemeral=True)
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Выбранный пользователь не является рекрутером или членом старшего состава.")
         embed = await self._build_goals_embed(пользователь.id, f"🎯 ЦЕЛИ | {пользователь.display_name}")
         await inter.edit_original_response(embed=embed)
 
@@ -101,18 +88,9 @@ class Goals(commands.Cog):
     @is_senior()
     async def delete(self, inter, пользователь: disnake.Member):
         await inter.response.defer(ephemeral=True)
-        async with db.transaction() as tx:
-            goals = await tx.fetchall(
-                "SELECT * FROM goals WHERE user_id=? AND status='active'",
-                (пользователь.id,),
-            )
-            if goals:
-                await tx.execute(
-                    "UPDATE goals SET status='deleted' WHERE user_id=? AND status='active'",
-                    (пользователь.id,),
-                )
-                await log(inter.author.id, "GOAL_DELETE", "user", пользователь.id, None, tx=tx)
-
+        if not is_recruiter_or_higher(пользователь):
+            return await inter.edit_original_response(content="❌ Выбранный пользователь не является рекрутером или членом старшего состава.")
+        goals = await goal_service.delete_active_goals(пользователь.id, inter.author.id)
         if not goals:
             return await inter.edit_original_response(content="Нет активных целей.")
 

@@ -1,6 +1,8 @@
 import asyncio
 import logging
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 
 import disnake
 from disnake.ext import commands
@@ -9,9 +11,20 @@ import config
 from database.db import db
 
 
+class BotTimezoneFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        if config.TIMEZONE.lower() == "system":
+            dt = datetime.fromtimestamp(record.created).astimezone()
+        else:
+            dt = datetime.fromtimestamp(record.created, ZoneInfo(config.TIMEZONE))
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
+
 def setup_logging():
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     root = logging.getLogger()
+    if getattr(root, "_recruiter_bot_logging", False):
+        return
+    formatter = BotTimezoneFormatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     root.setLevel(logging.INFO)
 
     console = logging.StreamHandler()
@@ -21,6 +34,7 @@ def setup_logging():
     file_handler = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
+    root._recruiter_bot_logging = True
 
 
 logger = logging.getLogger(__name__)

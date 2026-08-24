@@ -1,8 +1,8 @@
 from datetime import timedelta
 
 from database.db import db
-from services.finance_service import get_balance, get_general_balance
-from utils.time_utils import local_now, period_start, to_db
+from services.finance_service import get_balance
+from utils.time_utils import local_now, local_to_utc_naive, period_start, to_db
 
 
 def _period_clause(start, expression: str):
@@ -25,7 +25,7 @@ async def user_statistics(user_id: int, period: str):
             SUM(CASE WHEN sm.status='cancelled' THEN 1 ELSE 0 END) AS cancelled_shifts,
             SUM(CASE WHEN sm.status='removed' THEN 1 ELSE 0 END) AS removed_shifts,
             COALESCE(SUM(
-                CASE WHEN sm.actual_start IS NOT NULL AND sm.actual_end IS NOT NULL
+                CASE WHEN sm.status='completed' AND sm.actual_start IS NOT NULL AND sm.actual_end IS NOT NULL
                      THEN (julianday(sm.actual_end)-julianday(sm.actual_start))*24.0
                      ELSE 0 END
             ), 0) AS total_hours
@@ -202,5 +202,22 @@ async def weekly_summary(start=None, end=None):
         "base": sum(int(row["base_count"] or 0) for row in rows),
         "self": sum(int(row["self_found"] or 0) for row in rows),
     }
-    accrued, paid, available = await get_general_balance()
+    # finances.created_at создаётся SQLite в UTC, поэтому границы локальной недели
+    # переводим в naive UTC перед сравнением. Иначе недельный отчёт показывал
+    # накопительные финансы за всё время.
+    finance_start = local_to_utc_naive(start)
+    finance_end = local_to_utc_naive(end)
+    finance = await db.fetchone(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN type='salary' AND status='accrued' THEN amount ELSE 0 END),0) AS accrued,
+            COALESCE(SUM(CASE WHEN type='pay' AND status='paid' THEN amount ELSE 0 END),0) AS paid
+        FROM finances
+        WHERE created_at >= ? AND created_at < ?
+        """,
+        (to_db(finance_start), to_db(finance_end)),
+    )
+    accrued = float(finance["accrued"] or 0)
+    paid = float(finance["paid"] or 0)
+    available = accrued - paid
     return start, [dict(row) for row in rows], total, (accrued, paid, available)
