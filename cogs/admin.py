@@ -1,12 +1,13 @@
 import logging
 import os
+import sqlite3
 import tempfile
 
 import disnake
 from disnake.ext import commands, tasks
 
 import config
-from database.db import db
+from database.db import db, finish_system_marker, reserve_system_marker
 from services.health_service import run_health_checks
 from utils.checks import is_admin
 from utils.time_utils import local_now, utc_now, format_utc_db
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.auto_backup.add_exception_type(sqlite3.OperationalError)
         self.auto_backup.start()
 
     def cog_unload(self):
@@ -33,18 +35,25 @@ class Admin(commands.Cog):
                 os.remove(path)
             raise
 
-    @tasks.loop(hours=24)
+    @tasks.loop(hours=1)
     async def auto_backup(self):
+        day_marker = int(local_now().strftime("%Y%m%d"))
+        if not await reserve_system_marker("AUTO_BACKUP", "day", day_marker):
+            return
         channel = self.bot.get_channel(config.LOGS_CHANNEL_ID)
         if not channel:
+            await finish_system_marker("AUTO_BACKUP", "day", day_marker, False, "LOGS_CHANNEL_ID not found")
             logger.error("Канал логов для автобэкапа не найден")
             return
         path = None
         try:
             path = await self._make_backup()
             await channel.send(content="📦 Автоматический бэкап базы данных", file=disnake.File(path))
-        except Exception:
+        except Exception as exc:
+            await finish_system_marker("AUTO_BACKUP", "day", day_marker, False, str(exc)[:1000])
             logger.exception("Ошибка автоматического бэкапа")
+        else:
+            await finish_system_marker("AUTO_BACKUP", "day", day_marker, True)
         finally:
             if path and os.path.exists(path):
                 os.remove(path)
@@ -83,6 +92,9 @@ class Admin(commands.Cog):
         try:
             path = await self._make_backup()
             await inter.edit_original_response(content="📦 Бэкап готов:", file=disnake.File(path))
+        except Exception:
+            logger.exception("Ошибка ручного бэкапа")
+            await inter.edit_original_response(content="❌ Не удалось создать бэкап. Ошибка записана в лог.")
         finally:
             if path and os.path.exists(path):
                 os.remove(path)
@@ -111,10 +123,11 @@ class Admin(commands.Cog):
             embed.description = "Записей уведомлений пока нет. Напоминания создаются только для рекрутеров, которые записались на смену."
         for row in rows:
             error = (row["last_error"] or "—")[:180]
+            who = f"<@{row['user_id']}> • ID: `{row['user_id']}`" if row["user_id"] else "Система"
             embed.add_field(
                 name=f"#{row['id']} | {row['type']} | {row['status']}",
                 value=(
-                    f"Пользователь: <@{row['user_id']}>\n"
+                    f"Пользователь: {who}\n"
                     f"Объект: {row['object_type']} #{row['object_id']}\n"
                     f"Обновлено: {format_utc_db(row['updated_at'])}\n"
                     f"Попыток: {row['attempts']} | Ошибка: {error}"

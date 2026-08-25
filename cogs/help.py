@@ -17,7 +17,7 @@ class Help(commands.Cog):
         role_name = "Администратор" if is_admin else "Старший состав" if is_senior else "Рекрутер"
         embed = disnake.Embed(
             title="🆘 ПОМОЩЬ — СИСТЕМА РЕКРУТИНГА",
-            description="Выберите раздел. Команды ниже соответствуют текущей версии бота.",
+            description="Выберите раздел. Для обычной работы используйте **кнопочную панель**; slash-команды оставлены как резерв.",
             color=disnake.Color.blue(),
         )
         embed.add_field(name="Ваша роль", value=role_name, inline=False)
@@ -35,6 +35,9 @@ class HelpMenuView(disnake.ui.View):
         if inter.author.id != self.user.id:
             await inter.response.send_message("❌ Это не ваше меню.", ephemeral=True)
             return False
+        roles={role.id for role in getattr(inter.author,"roles",[])}
+        self.is_admin=config.ADMIN_ROLE_ID in roles
+        self.is_senior=config.SENIOR_ROLE_ID in roles or self.is_admin
         return True
 
     async def send_section(self, inter, title, description, fields):
@@ -47,6 +50,7 @@ class HelpMenuView(disnake.ui.View):
     @disnake.ui.button(label="📋 Смены", style=disnake.ButtonStyle.primary, row=0)
     async def btn_shifts(self, button, inter):
         fields = [
+            ("Основной путь", "**Панель → 🕐 Смена**: начать • завершить • выйти • расписание • исправить отчёт."),
             ("Как взять смену", "В канале смен нажмите **Взять смену** и введите свой статик."),
             ("/смена выйти", "Отказаться от забронированной смены до её начала; место снова станет свободным."),
             ("/смена начать", "Начать ближайшую забронированную смену. Доступно за несколько минут до начала."),
@@ -67,7 +71,8 @@ class HelpMenuView(disnake.ui.View):
     @disnake.ui.button(label="📊 Статистика", style=disnake.ButtonStyle.primary, row=0)
     async def btn_stats(self, button, inter):
         fields = [
-            ("/статистика моя", "Личная статистика за выбранный период."),
+            ("Основной путь", "**Панель → 📈 Статистика** — сегодня, неделя, месяц, всё время, рейтинг и неделя по дням."),
+            ("/статистика моя", "Резерв: личная статистика за выбранный период."),
             ("/статистика неделя", "Статистика текущей недели по дням."),
             ("/статистика топ", "Рейтинг рекрутеров."),
         ]
@@ -77,7 +82,7 @@ class HelpMenuView(disnake.ui.View):
 
     @disnake.ui.button(label="💰 Финансы", style=disnake.ButtonStyle.primary, row=0)
     async def btn_finance(self, button, inter):
-        fields = [("/финансы мои", "Начисления, выплаты и текущий остаток.")]
+        fields = [("Основной путь", "**Панель → 💳 Финансы** — начисления, выплаты и текущий остаток."), ("/финансы мои", "Резервная slash-команда.")]
         if self.is_senior:
             fields += [
                 ("/финансы общие", "Общие суммы по журналу финансов."),
@@ -93,7 +98,7 @@ class HelpMenuView(disnake.ui.View):
 
     @disnake.ui.button(label="🎯 Цели", style=disnake.ButtonStyle.primary, row=0)
     async def btn_goals(self, button, inter):
-        fields = [("/цель мои", "Мои активные цели."), ("/цель прогресс", "Текущий прогресс целей.")]
+        fields = [("Основной путь", "**Панель → 🎯 Цели** — активные цели и фактический прогресс."), ("/цель мои / /цель прогресс", "Резервные slash-команды.")]
         if self.is_senior:
             fields += [
                 ("/цель поставить", "Поставить цель по людям, сменам или часам."),
@@ -104,14 +109,14 @@ class HelpMenuView(disnake.ui.View):
 
     @disnake.ui.button(label="👤 Профиль", style=disnake.ButtonStyle.primary, row=0)
     async def btn_profile(self, button, inter):
-        fields = [("/рекрутер профиль", "Профиль и агрегированная статистика рекрутера.")]
+        fields = [("Основной путь", "**Панель → 👤 Профиль** — мой профиль или профиль действующего рекрутера."), ("/рекрутер профиль", "Резервная slash-команда.")]
         if self.is_senior:
             fields.append(("/рекрутер заметка", "Добавить служебную заметку. Обычные рекрутеры её не видят."))
         await self.send_section(inter, "👤 ПРОФИЛЬ", "Профиль рекрутера", fields)
 
     @disnake.ui.button(label="📋 Инвайты", style=disnake.ButtonStyle.primary, row=1)
     async def btn_invites(self, button, inter):
-        fields = [("/инвайт отчёт", "Создать отчёт о приглашённом."), ("/инвайт мои", "Мои инвайты.")]
+        fields = [("Основной путь", "**Панель → 👥 Инвайты** — новый инвайт или мои инвайты."), ("/инвайт отчёт / /инвайт мои", "Резервные slash-команды.")]
         if self.is_senior:
             fields += [
                 ("/инвайт проверить", "Список ожидающих проверки."),
@@ -136,9 +141,9 @@ class HelpMenuView(disnake.ui.View):
     async def btn_how(self, button, inter):
         fields = [
             ("1️⃣ Запись", "Берёте смену кнопкой в канале."),
-            ("2️⃣ Старт", "Используете `/смена начать`."),
+            ("2️⃣ Старт", "Панель → **Смена** → **Начать**."),
             ("3️⃣ Работа", "Выполняете рекрутинг."),
-            ("4️⃣ Отчёт", "Используете `/смена завершить`."),
+            ("4️⃣ Отчёт", "Панель → **Смена** → **Завершить** и заполняете отчёт."),
             ("5️⃣ Проверка", "Старший одобряет или отклоняет отчёт."),
             ("6️⃣ Учёт", "Одобренный отчёт попадает в статистику и цели. Деньги начисляются отдельно."),
         ]
@@ -158,7 +163,8 @@ class HelpMenuView(disnake.ui.View):
         if not self.is_admin:
             return await inter.response.send_message("❌ Нет доступа.", ephemeral=True)
         fields = [
-            ("/админ логи", "Последние события системы."),
+            ("Основной путь", "**Панель → ⚙️ Админ**: время • уведомления • логи • бэкап • здоровье • финансы • база • ЧС."),
+            ("/админ логи", "Резерв: последние события системы."),
             ("/админ бэкап", "Консистентный SQLite-бэкап."),
             ("/админ здоровье", "Проверка БД, каналов, ролей и фоновых задач."),
             ("/админ время", "Показать фактические TIMEZONE и текущее время бота."),
@@ -168,8 +174,22 @@ class HelpMenuView(disnake.ui.View):
             ("/база найти", "Поиск по Discord ID, статику или имени."),
             ("/база статик / заметка", "Безопасное исправление статика и служебных заметок."),
             ("/база финоперация", "Просмотр конкретной финансовой операции по ID."),
+            ("Чёрный список", "Только Admin: добавить, дополнить, найти, история и снять с обязательной причиной."),
         ]
         await self.send_section(inter, "⚙️ АДМИН", "Диагностика и обслуживание", fields)
+
+    @disnake.ui.button(label="🚫 ЧС", style=disnake.ButtonStyle.danger, row=2)
+    async def btn_blacklist(self, button, inter):
+        if not self.is_admin:
+            return await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
+        fields = [
+            ("Добавить", "Только Admin может добавить человека. В карточке всегда сохраняются Discord-тег и Discord ID."),
+            ("Проверка инвайтов", "Активный ЧС автоматически блокирует новый инвайт и повторно проверяется при его одобрении."),
+            ("Поиск", "По Discord ID, статику, тегу или имени."),
+            ("История", "Снятые записи не удаляются — сохраняются причина, даты и ответственные."),
+        ]
+        fields.append(("Снять с ЧС", "Только Admin. Причина снятия обязательна."))
+        await self.send_section(inter, "🚫 ЧЁРНЫЙ СПИСОК", "Контроль нежелательных приглашений", fields)
 
     @disnake.ui.button(label="❌ Закрыть", style=disnake.ButtonStyle.gray, row=2)
     async def btn_close(self, button, inter):

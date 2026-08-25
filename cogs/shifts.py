@@ -9,6 +9,7 @@ from database.db import db, notify
 from services.errors import UserFacingError
 from services import shift_service
 from utils.checks import is_recruiter, is_senior, is_senior_or_admin, is_recruiter_or_higher
+from utils.discord_helpers import send_control_warning
 from utils.embeds import EmbedGenerator
 from utils.time_utils import local_now, parse_db
 
@@ -93,7 +94,7 @@ async def _notify_report_approved(bot, report, reviewer_mention: str):
     dm.add_field(name="📋 Смена", value=f"#{report['shift_id']}", inline=True)
     dm.add_field(name="👥 Принято", value=str(report["total_accepted"]), inline=True)
     dm.add_field(name="👤 Проверил", value=reviewer_mention, inline=True)
-    await notify(bot, report["user_id"], "REPORT_APPROVED", "shift_report", report["id"], embed=dm)
+    return await notify(bot, report["user_id"], "REPORT_APPROVED", "shift_report", report["id"], embed=dm)
 
 
 async def _notify_report_rejected(bot, report, reason: str):
@@ -105,7 +106,7 @@ async def _notify_report_rejected(bot, report, reason: str):
         value=f"Откройте **панель → 🕐 Смена → ♻️ Исправить отчёт**. Резервный способ: `/смена исправить отчёт:{report['id']}`.",
         inline=False,
     )
-    await notify(bot, report["user_id"], "REPORT_REJECTED", "shift_report", report["id"], embed=dm)
+    return await notify(bot, report["user_id"], "REPORT_REJECTED", "shift_report", report["id"], embed=dm)
 
 
 class TakeShiftModal(disnake.ui.Modal):
@@ -226,8 +227,11 @@ class FinishShiftModal(disnake.ui.Modal):
                     embed=embed,
                     view=build_report_view(result.report["id"]),
                 )
-                await shift_service.set_report_message_id(result.report["id"], message.id)
                 posted = True
+                try:
+                    await shift_service.set_report_message_id(result.report["id"], message.id)
+                except Exception:
+                    logger.exception("Карточка отчёта #%s создана, но message_id не сохранён", result.report["id"])
             except Exception:
                 logger.exception("Не удалось отправить отчёт #%s в канал отчётов", result.report["id"])
         else:
@@ -236,9 +240,15 @@ class FinishShiftModal(disnake.ui.Modal):
         if posted:
             text = f"✅ Смена **#{self.shift_id}** завершена. Отчёт **#{result.report['id']}** отправлен на проверку."
         else:
+            warned = await send_control_warning(
+                inter.guild,
+                f"⚠️ <@&{config.SENIOR_ROLE_ID}> отчёт **#{result.report['id']}** по смене **#{self.shift_id}** "
+                "сохранён в БД, но публичная карточка не была создана. Проверьте отчёт через панель руководства.",
+            )
             text = (
                 f"⚠️ Смена **#{self.shift_id}** завершена и отчёт **#{result.report['id']}** сохранён в базе, "
-                "но отправить карточку в канал отчётов не удалось. Сообщите старшему составу."
+                "но отправить карточку в канал отчётов не удалось. "
+                + ("Старший состав уведомлён." if warned else "Откройте панель руководства и сообщите старшему составу.")
             )
         await inter.edit_original_response(content=text)
         await update_shift_message(inter.guild, self.shift_id)
@@ -296,8 +306,11 @@ class ResubmitReportModal(disnake.ui.Modal):
                     embed=embed,
                     view=build_report_view(result.report["id"]),
                 )
-                await shift_service.set_report_message_id(result.report["id"], message.id)
                 posted = True
+                try:
+                    await shift_service.set_report_message_id(result.report["id"], message.id)
+                except Exception:
+                    logger.exception("Исправленная карточка отчёта #%s создана, но message_id не сохранён", result.report["id"])
             except Exception:
                 logger.exception("Не удалось повторно отправить отчёт #%s", self.report_id)
         else:
@@ -305,8 +318,14 @@ class ResubmitReportModal(disnake.ui.Modal):
         if posted:
             text = f"✅ Отчёт **#{self.report_id}** исправлен и снова отправлен на проверку."
         else:
+            warned = await send_control_warning(
+                inter.guild,
+                f"⚠️ <@&{config.SENIOR_ROLE_ID}> исправленный отчёт **#{self.report_id}** сохранён в БД, "
+                "но публичная карточка не была создана. Проверьте отчёт через панель руководства.",
+            )
             text = (f"⚠️ Отчёт **#{self.report_id}** исправлен и сохранён в базе, но карточку в канал отчётов "
-                    "отправить не удалось. Сообщите старшему составу.")
+                    "отправить не удалось. "
+                    + ("Старший состав уведомлён." if warned else "Откройте панель руководства и сообщите старшему составу."))
         await inter.edit_original_response(content=text)
 
 
@@ -330,21 +349,26 @@ class RejectReportModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         if not is_senior_or_admin(inter.author):
             return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        reason = inter.text_values["reason"]
         try:
-            report = await shift_service.reject_report(
-                self.report_id, inter.author.id, inter.text_values["reason"]
-            )
+            report = await shift_service.reject_report(self.report_id, inter.author.id, reason)
         except UserFacingError as exc:
-            return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+            return await inter.edit_original_response(content=f"❌ {exc}")
 
-        embed = disnake.Embed(title="❌ ОТЧЁТ ОТКЛОНЁН", color=disnake.Color.red())
-        embed.add_field(name="📋 Отчёт", value=f"#{self.report_id}", inline=True)
-        embed.add_field(name="👤 Проверил", value=inter.author.mention, inline=True)
-        embed.add_field(name="📝 Причина", value=inter.text_values["reason"], inline=False)
-        await inter.response.edit_message(embed=embed, view=None)
-
-        await _notify_report_rejected(inter.bot, report, inter.text_values["reason"])
-        await sync_report_review_message(inter.guild, self.report_id, False, inter.author.mention, inter.text_values["reason"])
+        dm_sent = await _notify_report_rejected(inter.bot, report, reason)
+        synced = await sync_report_review_message(
+            inter.guild, self.report_id, False, inter.author.mention, reason
+        )
+        warnings = []
+        if not synced:
+            warnings.append("публичная карточка не обновилась")
+        if not dm_sent:
+            warnings.append("ЛС рекрутеру не доставлено")
+        text = f"✅ Отчёт **#{self.report_id}** отклонён."
+        if warnings:
+            text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
 
 async def update_shift_message(guild, shift_id: int) -> bool:
@@ -496,17 +520,25 @@ class Shifts(commands.Cog):
                     report_id = int(footer.split("#")[-1])
                 else:
                     report_id = int(custom_id.rsplit(":", 1)[1])
+            except (ValueError, IndexError, AttributeError):
+                return await inter.response.send_message("❌ Не удалось определить ID отчёта.", ephemeral=True)
+            await inter.response.defer(ephemeral=True)
+            try:
                 report = await shift_service.approve_report(report_id, inter.author.id)
-            except (ValueError, UserFacingError) as exc:
-                return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+            except UserFacingError as exc:
+                return await inter.edit_original_response(content=f"❌ {exc}")
 
-            embed = disnake.Embed(title="✅ ОТЧЁТ ОДОБРЕН", color=disnake.Color.green())
-            embed.add_field(name="📋 Отчёт", value=f"#{report_id}", inline=True)
-            embed.add_field(name="👤 Проверил", value=inter.author.mention, inline=True)
-            await inter.response.edit_message(embed=embed, view=None)
-
-            await _notify_report_approved(self.bot, report, inter.author.mention)
-            await sync_report_review_message(inter.guild, report_id, True, inter.author.mention)
+            dm_sent = await _notify_report_approved(self.bot, report, inter.author.mention)
+            synced = await sync_report_review_message(inter.guild, report_id, True, inter.author.mention)
+            warnings = []
+            if not synced:
+                warnings.append("публичная карточка не обновилась")
+            if not dm_sent:
+                warnings.append("ЛС рекрутеру не доставлено")
+            text = f"✅ Отчёт **#{report_id}** одобрен."
+            if warnings:
+                text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+            await inter.edit_original_response(content=text)
             return
 
         if custom_id.startswith("report:reject:") or custom_id == "reject_report":
@@ -621,9 +653,17 @@ class Shifts(commands.Cog):
             report = await shift_service.approve_report(отчёт, inter.author.id)
         except UserFacingError as exc:
             return await inter.edit_original_response(content=f"❌ {exc}")
-        await _notify_report_approved(self.bot, report, inter.author.mention)
-        await sync_report_review_message(inter.guild, отчёт, True, inter.author.mention)
-        await inter.edit_original_response(content=f"✅ Отчёт **#{отчёт}** одобрен.")
+        dm_sent = await _notify_report_approved(self.bot, report, inter.author.mention)
+        synced = await sync_report_review_message(inter.guild, отчёт, True, inter.author.mention)
+        warnings = []
+        if not synced:
+            warnings.append("публичная карточка не обновилась")
+        if not dm_sent:
+            warnings.append("ЛС рекрутеру не доставлено")
+        text = f"✅ Отчёт **#{отчёт}** одобрен."
+        if warnings:
+            text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
     @shift.sub_command(name="отклонить", description="Отклонить отчёт по ID (резервный способ)")
     @is_senior()
@@ -633,9 +673,17 @@ class Shifts(commands.Cog):
             report = await shift_service.reject_report(отчёт, inter.author.id, причина)
         except UserFacingError as exc:
             return await inter.edit_original_response(content=f"❌ {exc}")
-        await _notify_report_rejected(self.bot, report, причина)
-        await sync_report_review_message(inter.guild, отчёт, False, inter.author.mention, причина)
-        await inter.edit_original_response(content=f"✅ Отчёт **#{отчёт}** отклонён.")
+        dm_sent = await _notify_report_rejected(self.bot, report, причина)
+        synced = await sync_report_review_message(inter.guild, отчёт, False, inter.author.mention, причина)
+        warnings = []
+        if not synced:
+            warnings.append("публичная карточка не обновилась")
+        if not dm_sent:
+            warnings.append("ЛС рекрутеру не доставлено")
+        text = f"✅ Отчёт **#{отчёт}** отклонён."
+        if warnings:
+            text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
     @shift.sub_command(name="снять", description="Снять рекрутера со смены")
     @is_senior()

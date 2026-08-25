@@ -17,6 +17,8 @@ async def set_goal(user_id: int, username: str | None, goal_type: str, value: in
     if value > MAX_GOAL_VALUE:
         raise UserFacingError(f"Значение цели не может быть больше {MAX_GOAL_VALUE:,}.")
 
+    current = await calculate_progress(user_id, goal_type, period)
+
     async with db.transaction() as tx:
         await ensure_user(user_id, username=username, tx=tx)
         await tx.execute(
@@ -25,10 +27,10 @@ async def set_goal(user_id: int, username: str | None, goal_type: str, value: in
         )
         cursor = await tx.execute(
             """
-            INSERT INTO goals (user_id, type, target_value, period, created_by)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO goals (user_id, type, target_value, current_value, period, created_by)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, goal_type, value, period, actor_id),
+            (user_id, goal_type, value, current, period, actor_id),
         )
         goal_id = cursor.lastrowid
         await log(
@@ -36,7 +38,7 @@ async def set_goal(user_id: int, username: str | None, goal_type: str, value: in
             "GOAL_SET",
             "goal",
             goal_id,
-            f"user={user_id}; {goal_type}={value}; period={period}",
+            f"user={user_id}; {goal_type}={value}; current={current}; period={period}",
             tx=tx,
         )
         return goal_id

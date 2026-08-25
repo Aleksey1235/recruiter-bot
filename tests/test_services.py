@@ -78,7 +78,7 @@ sys.modules.setdefault("aiosqlite", fake_aiosqlite)
 
 import config
 from database.db import _reserve_notification, db
-from services import database_service, finance_service, goal_service, invite_service, shift_service, statistics_service
+from services import blacklist_service, database_service, finance_service, goal_service, invite_service, shift_service, statistics_service
 from services.errors import UserFacingError
 from services.health_service import run_health_checks
 from utils.time_utils import format_utc_db, local_now, to_db
@@ -289,7 +289,7 @@ def test_legacy_database_migration_with_existing_rows():
         backup_paths = []
         try:
             await reset_database(path)
-            backup_paths = list(Path(path).parent.glob(Path(path).name + ".pre_v3_*.db"))
+            backup_paths = list(Path(path).parent.glob(Path(path).name + ".pre_v4_*.db"))
             assert len(backup_paths) == 1
             member_columns = {row["name"] for row in await db.fetchall("PRAGMA table_info(shift_members)")}
             notification_columns = {row["name"] for row in await db.fetchall("PRAGMA table_info(notifications)")}
@@ -317,7 +317,7 @@ def test_legacy_database_migration_with_existing_rows():
             assert "idx_notifications_status" in indexes
             assert "idx_shift_members_actual_start" in indexes
             version = await db.fetchone("PRAGMA user_version")
-            assert version[0] == 3
+            assert version[0] == 4
 
             # New rows in columns added to a populated legacy table must still
             # receive timestamps via migration triggers.
@@ -899,7 +899,7 @@ def test_goal_service_replaces_same_type_validates_and_deletes_transactionally()
     asyncio.run(scenario())
 
 
-def test_v2_to_v3_migration_preserves_existing_report_and_invite_rows():
+def test_v2_to_v4_migration_preserves_existing_report_and_invite_rows():
     async def scenario():
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -952,14 +952,14 @@ def test_v2_to_v3_migration_preserves_existing_report_and_invite_rows():
         backups = []
         try:
             await reset_database(path)
-            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v3_*.db"))
+            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v4_*.db"))
             assert len(backups) == 1
             report = await db.fetchone("SELECT id, user_id, total_accepted, message_id FROM shift_reports WHERE id=7")
             invite = await db.fetchone("SELECT id, user_id, static_id, full_name, message_id FROM invites WHERE id=8")
             assert dict(report) == {"id": 7, "user_id": 501, "total_accepted": 4, "message_id": None}
             assert dict(invite) == {"id": 8, "user_id": 777, "static_id": "777", "full_name": "Old Invite", "message_id": None}
             version = await db.fetchone("PRAGMA user_version")
-            assert version[0] == 3
+            assert version[0] == 4
         finally:
             await db.close()
             if os.path.exists(path):
@@ -982,12 +982,19 @@ def test_health_service_detects_clean_database_and_slot_anomaly():
         check_suspicious = DummyLoop()
         weekly_report = DummyLoop()
 
+    class DummyAdmin:
+        auto_backup = DummyLoop()
+
     class DummyBot:
         def get_guild(self, _guild_id):
             return None
 
         def get_cog(self, name):
-            return DummyTasks() if name == "Tasks" else None
+            if name == "Tasks":
+                return DummyTasks()
+            if name == "Admin":
+                return DummyAdmin()
+            return None
 
     async def scenario():
         path = temporary_database_path()
@@ -1053,4 +1060,487 @@ def test_resubmission_drops_stale_public_message_binding():
             await db.close()
             if os.path.exists(path):
                 os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_health_domain_diagnostics_and_safe_repair_legacy_self_invite():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            await db.execute(
+                """
+                INSERT INTO invites
+                    (user_id, static_id, invited_by, full_name, ticket, last_name_changed,
+                     organization, fraction, info, status)
+                VALUES (42, 'SELF42', 42, 'Legacy Self', 'yes', 'yes', 'yes', 'yes', 'yes', 'accepted')
+                """
+            )
+            from services.health_service import get_domain_anomalies, repair_safe_domain_anomalies
+
+            issues = await get_domain_anomalies()
+            assert any("INVITE #" in item and "самого рекрутера" in item for item in issues)
+
+            fixes = await repair_safe_domain_anomalies(actor_id=900)
+            assert any("ошибочная привязка" in item for item in fixes)
+
+            row = await db.fetchone("SELECT user_id, invited_by, static_id, status FROM invites WHERE static_id='SELF42'")
+            assert row["user_id"] is None
+            assert row["invited_by"] == 42
+            assert row["static_id"] == "SELF42"
+            assert row["status"] == "accepted"
+            assert await get_domain_anomalies() == []
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+
+    asyncio.run(scenario())
+
+
+
+def test_blacklist_full_lifecycle_blocks_invites_and_preserves_history():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            checklist = {"ticket":"yes","last_name":"yes","organization":"yes","fraction":"yes","info":"yes"}
+
+            entry = await blacklist_service.add_entry(
+                7001, "TargetUser", "ST7001", "Target User", "Нарушение правил",
+                "https://example.invalid/evidence", "test note", 900,
+            )
+            assert entry["status"] == "active"
+            assert entry["discord_id"] == 7001
+            assert entry["discord_tag"] == "TargetUser"
+            assert "Discord ID: 7001" in blacklist_service.identity_text(entry)
+
+            await expect_user_error(
+                invite_service.create_invite(7001, 501, "recruiter", "OTHER", "Target User", checklist),
+                "чёрном списке",
+            )
+            await expect_user_error(
+                invite_service.create_invite(7002, 501, "recruiter", "ST7001", "Another User", checklist),
+                "чёрном списке",
+            )
+
+            logs = await db.fetchall("SELECT action FROM logs WHERE object_type='blacklist' ORDER BY id")
+            assert any(row["action"] == "BLACKLIST_ADD" for row in logs)
+            assert any(row["action"] == "BLACKLIST_BLOCK_INVITE" for row in logs)
+
+            removed = await blacklist_service.remove_entry(entry["id"], 999, "Решение администратора")
+            assert removed["status"] == "removed"
+            assert removed["removed_by"] == 999
+            assert removed["remove_reason"] == "Решение администратора"
+            assert (await blacklist_service.get_active_match(7001, "ST7001")) is None
+
+            invite_id = await invite_service.create_invite(7001, 501, "recruiter", "ST7001", "Target User", checklist)
+            assert invite_id > 0
+
+            history = await blacklist_service.list_history(10)
+            history_entry = next(row for row in history if row["id"] == entry["id"])
+            assert history_entry["status"] == "removed"
+            assert history_entry["reason"] == "Нарушение правил"
+
+            second = await blacklist_service.add_entry(
+                7001, "TargetUserRenamed", "ST7001", "Target User", "Повторный ЧС", None, None, 900,
+            )
+            assert second["status"] == "active"
+            await expect_user_error(
+                blacklist_service.add_entry(7001, "Duplicate", "XX", "Dup", "reason", None, None, 900),
+                "уже находится",
+            )
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_pending_invite_cannot_be_approved_after_target_is_blacklisted():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            checklist = {"ticket":"yes","last_name":"yes","organization":"yes","fraction":"no","info":"yes"}
+            invite_id = await invite_service.create_invite(7101, 510, "recruiter", "ST7101", "Pending Target", checklist)
+            await blacklist_service.add_entry(
+                7101, "PendingTarget", "ST7101", "Pending Target", "Добавлен после отчёта", None, None, 900,
+            )
+            await expect_user_error(invite_service.approve_invite(invite_id, 901, 100), "чёрном списке")
+            invite = await db.fetchone("SELECT status FROM invites WHERE id=?", (invite_id,))
+            assert invite["status"] == "pending"
+            finance = await db.fetchone("SELECT COUNT(*) AS count FROM finances WHERE reason='Инвайт'")
+            assert finance["count"] == 0
+            block_log = await db.fetchone(
+                "SELECT * FROM logs WHERE action='BLACKLIST_BLOCK_APPROVE' AND object_type='blacklist' ORDER BY id DESC LIMIT 1"
+            )
+            assert block_log is not None
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_blacklist_search_duplicate_guards_and_health_check():
+    class DummyLoop:
+        def is_running(self): return True
+    class DummyTasks:
+        check_shifts = DummyLoop(); check_reports = DummyLoop(); check_suspicious = DummyLoop(); weekly_report = DummyLoop()
+    class DummyAdmin:
+        auto_backup = DummyLoop()
+    class DummyBot:
+        def get_guild(self, _guild_id): return None
+        def get_cog(self, name):
+            if name == "Tasks": return DummyTasks()
+            if name == "Admin": return DummyAdmin()
+            return None
+
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            row = await blacklist_service.add_entry(7201, "SearchTag", "STATIC7201", "Search Person", "reason", None, None, 900)
+            assert (await blacklist_service.search_entries("7201"))[0]["id"] == row["id"]
+            assert (await blacklist_service.search_entries("STATIC7201"))[0]["id"] == row["id"]
+            assert (await blacklist_service.search_entries("SearchTag"))[0]["id"] == row["id"]
+            assert (await blacklist_service.search_entries("Search Person"))[0]["id"] == row["id"]
+
+            checks = await run_health_checks(DummyBot())
+            by_name = {check.name: check for check in checks}
+            assert by_name["Чёрный список"].ok
+            assert by_name["Схема БД"].ok
+
+            await blacklist_service.remove_entry(row["id"], 999, "clean")
+            await expect_user_error(blacklist_service.remove_entry(row["id"], 999, "again"), "уже снята")
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_v3_to_v4_migration_creates_blacklist_without_losing_data():
+    async def scenario():
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            PRAGMA user_version=3;
+            CREATE TABLE users (
+                discord_id INTEGER PRIMARY KEY,
+                username TEXT,
+                static_id TEXT,
+                role TEXT DEFAULT 'recruiter',
+                level INTEGER DEFAULT 1,
+                total_salary REAL DEFAULT 0,
+                paid_salary REAL DEFAULT 0,
+                warns INTEGER DEFAULT 0,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO users(discord_id, username, static_id) VALUES(77, 'before-v4', '77');
+            """
+        )
+        connection.commit(); connection.close()
+        backups = []
+        try:
+            await reset_database(path)
+            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v4_*.db"))
+            assert len(backups) == 1
+            old = await db.fetchone("SELECT username, static_id FROM users WHERE discord_id=77")
+            assert dict(old) == {"username": "before-v4", "static_id": "77"}
+            tables = {row["name"] for row in await db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "blacklist" in tables
+            version = await db.fetchone("PRAGMA user_version")
+            assert version[0] == 4
+        finally:
+            await db.close()
+            if os.path.exists(path): os.remove(path)
+            for backup in backups:
+                if backup.exists(): backup.unlink()
+    asyncio.run(scenario())
+
+
+
+def test_blacklist_rejects_self_add_and_database_overview_exposes_active_status():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            await expect_user_error(
+                blacklist_service.add_entry(900, "AdminSelf", "900", "Admin", "reason", None, None, 900),
+                "самого себя",
+            )
+            await db.execute("INSERT INTO users(discord_id, username, static_id) VALUES(7301, 'profile7301', 'ST7301')")
+            entry = await blacklist_service.add_entry(
+                7301, "ProfileTarget", "ST7301", "Profile Target", "reason", None, None, 900
+            )
+            overview = await database_service.get_user_overview(7301)
+            assert overview is not None
+            assert overview["blacklist"]["id"] == entry["id"]
+            assert overview["blacklist"]["discord_id"] == 7301
+        finally:
+            await db.close()
+            if os.path.exists(path): os.remove(path)
+    asyncio.run(scenario())
+
+
+
+def test_blacklist_health_reports_concrete_invalid_record():
+    class DummyLoop:
+        def is_running(self): return True
+    class DummyTasks:
+        check_shifts = DummyLoop(); check_reports = DummyLoop(); check_suspicious = DummyLoop(); weekly_report = DummyLoop()
+    class DummyAdmin:
+        auto_backup = DummyLoop()
+    class DummyBot:
+        def get_guild(self, _guild_id): return None
+        def get_cog(self, name):
+            if name == "Tasks": return DummyTasks()
+            if name == "Admin": return DummyAdmin()
+            return None
+
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            # Represents corrupted/legacy data: removed status without removal audit fields.
+            await db.execute(
+                """
+                INSERT INTO blacklist(discord_id, discord_tag, static_id, reason, status, created_by)
+                VALUES(7401, 'BadLegacy', 'S7401', 'legacy', 'removed', 900)
+                """
+            )
+            from services.health_service import get_blacklist_anomalies
+            issues = await get_blacklist_anomalies()
+            assert any("BLACKLIST #" in issue and "нет администратора снятия" in issue for issue in issues)
+            checks = await run_health_checks(DummyBot())
+            by_name = {check.name: check for check in checks}
+            assert not by_name["Чёрный список"].ok
+            assert "BLACKLIST #" in by_name["Чёрный список"].details
+        finally:
+            await db.close()
+            if os.path.exists(path): os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_huge_discord_ids_do_not_overflow_sqlite_search_or_blacklist():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            huge = str(2**63) + "999999"
+            rows = await database_service.search_users(huge)
+            assert rows == []
+            rows = await blacklist_service.search_entries(huge)
+            assert rows == []
+            await expect_user_error(
+                blacklist_service.add_entry(int(huge), "TooHuge", None, None, "reason", None, None, 900),
+                "слишком большой",
+            )
+            # Invalid Discord ID must still allow a valid static-only blacklist match.
+            entry = await blacklist_service.add_entry(8401, "StaticTarget", "STATIC-HUGE", "Target", "reason", None, None, 900)
+            match = await blacklist_service.get_active_match(int(huge), "STATIC-HUGE")
+            assert match["id"] == entry["id"]
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_blacklist_details_update_preserves_history_and_logs_actor():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            row = await blacklist_service.add_entry(
+                8501, "Target8501", "S8501", "Target", "reason", "old evidence", "old note", 900
+            )
+            updated = await blacklist_service.update_entry_details(
+                row["id"], 901, "new evidence", "new note"
+            )
+            assert updated["evidence"] == "new evidence"
+            assert "old note" in updated["notes"]
+            assert "new note" in updated["notes"]
+            log_row = await db.fetchone(
+                "SELECT * FROM logs WHERE object_type='blacklist' AND object_id=? ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            )
+            assert log_row["action"] == "BLACKLIST_UPDATE"
+            assert log_row["user_id"] == 901
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_public_invite_blacklist_precheck_is_logged():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            row = await blacklist_service.add_entry(8601, "Target8601", "S8601", "Target", "blocked", None, None, 900)
+            await expect_user_error(
+                invite_service.assert_target_not_blacklisted(8601, "S8601", 501),
+                "чёрном списке",
+            )
+            block_log = await db.fetchone(
+                "SELECT * FROM logs WHERE action='BLACKLIST_BLOCK_INVITE' ORDER BY id DESC LIMIT 1"
+            )
+            assert block_log is not None
+            assert block_log["object_id"] == row["id"]
+            assert block_log["user_id"] == 501
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_goal_created_mid_period_starts_with_existing_real_progress():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            now = local_now().replace(microsecond=0)
+            shift_id = await shift_service.create_shift(900, now + timedelta(minutes=5), now + timedelta(hours=1), 1, "goal-progress")
+            member_id = await shift_service.take_shift(shift_id, 8701, "recruit8701", "8701")
+            await shift_service.start_shift(member_id, 8701)
+            result = await shift_service.finish_shift(member_id, 8701, 7, 5, 2, "")
+            await shift_service.approve_report(result.report["id"], 901)
+
+            people_goal = await goal_service.set_goal(8701, "recruit8701", "люди", 20, "неделя", 901)
+            shifts_goal = await goal_service.set_goal(8701, "recruit8701", "смены", 5, "неделя", 901)
+            people = await db.fetchone("SELECT current_value FROM goals WHERE id=?", (people_goal,))
+            shifts = await db.fetchone("SELECT current_value FROM goals WHERE id=?", (shifts_goal,))
+            assert people["current_value"] == 7
+            assert shifts["current_value"] == 1
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_recalculate_does_not_reopen_empty_shift_after_official_start():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            now = local_now().replace(microsecond=0)
+            shift_id = await shift_service.create_shift(900, now + timedelta(minutes=5), now + timedelta(hours=1), 1, "recalc")
+            member_id = await shift_service.take_shift(shift_id, 8801, "recruit8801", "8801")
+            await shift_service.start_shift(member_id, 8801)
+            # Emulate the clock having crossed official start without waiting.
+            await db.execute(
+                "UPDATE shifts SET scheduled_start=?, scheduled_end=? WHERE id=?",
+                (to_db(now - timedelta(minutes=1)), to_db(now + timedelta(hours=1)), shift_id),
+            )
+            changed = await shift_service.remove_member(901, 8801, "removed after start", shift_id)
+            assert changed == shift_id
+            shift = await db.fetchone("SELECT status, slots FROM shifts WHERE id=?", (shift_id,))
+            assert shift["status"] == "missed"
+            assert shift["slots"] == 1
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_health_reports_concrete_report_pointer_and_notification_anomalies():
+    class DummyLoop:
+        def is_running(self): return True
+    class DummyTasks:
+        check_shifts = DummyLoop(); check_reports = DummyLoop(); check_suspicious = DummyLoop(); weekly_report = DummyLoop()
+    class DummyAdmin:
+        auto_backup = DummyLoop()
+    class DummyBot:
+        def get_guild(self, _): return None
+        def get_cog(self, name):
+            if name == "Tasks": return DummyTasks()
+            if name == "Admin": return DummyAdmin()
+            return None
+
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            now = local_now().replace(microsecond=0)
+            shift_id = await shift_service.create_shift(900, now + timedelta(minutes=5), now + timedelta(hours=1), 1, "health-pointer")
+            member_id = await shift_service.take_shift(shift_id, 8901, "recruit8901", "8901")
+            await shift_service.start_shift(member_id, 8901)
+            result = await shift_service.finish_shift(member_id, 8901, 1, 1, 0, "")
+            await db.execute("UPDATE shift_members SET report_id=? WHERE id=?", (result.report["id"] + 999, member_id))
+
+            # Simulate a legacy/corrupted notification row bypassing CHECK constraints.
+            await db.execute("PRAGMA ignore_check_constraints=ON")
+            await db.execute(
+                "INSERT INTO notifications(user_id,type,object_type,object_id,status,attempts) VALUES(1,'X','shift',1,'broken',-1)"
+            )
+            checks = {c.name: c for c in await run_health_checks(DummyBot())}
+            assert not checks["Данные смен/отчётов"].ok
+            assert "MEMBER #" in checks["Данные смен/отчётов"].details
+            assert not checks["Уведомления"].ok
+            assert "NOTIFY #" in checks["Уведомления"].details
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_start_selector_refuses_ambiguous_legacy_startable_shifts():
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            now = local_now().replace(microsecond=0)
+            s1 = await shift_service.create_shift(900, now + timedelta(minutes=3), now + timedelta(hours=1), 1, "legacy-a")
+            s2 = await shift_service.create_shift(900, now + timedelta(minutes=4), now + timedelta(hours=1, minutes=10), 1, "legacy-b")
+            # Bypass take_shift overlap protection to emulate old/corrupt data.
+            await db.execute("INSERT INTO shift_members(shift_id,user_id,static_id,status) VALUES(?,9001,'9001','booked')", (s1,))
+            await db.execute("INSERT INTO shift_members(shift_id,user_id,static_id,status) VALUES(?,9001,'9001','booked')", (s2,))
+            await expect_user_error(shift_service.find_shift_to_start(9001), "несколько смен")
+        finally:
+            await db.close()
+            if os.path.exists(path):
+                os.remove(path)
+    asyncio.run(scenario())
+
+
+def test_health_detects_overlapping_live_bookings_from_legacy_data():
+    class DummyLoop:
+        def is_running(self): return True
+    class DummyTasks:
+        check_shifts = DummyLoop(); check_reports = DummyLoop(); check_suspicious = DummyLoop(); weekly_report = DummyLoop()
+    class DummyAdmin:
+        auto_backup = DummyLoop()
+    class DummyBot:
+        def get_guild(self, _): return None
+        def get_cog(self, name):
+            if name == "Tasks": return DummyTasks()
+            if name == "Admin": return DummyAdmin()
+            return None
+
+    async def scenario():
+        path = temporary_database_path()
+        try:
+            await reset_database(path)
+            now = local_now().replace(microsecond=0)
+            s1 = await shift_service.create_shift(900, now + timedelta(minutes=20), now + timedelta(hours=1), 1, "overlap-1")
+            s2 = await shift_service.create_shift(900, now + timedelta(minutes=30), now + timedelta(hours=2), 1, "overlap-2")
+            await db.execute("INSERT INTO shift_members(shift_id,user_id,static_id,status) VALUES(?,9101,'9101','booked')", (s1,))
+            await db.execute("INSERT INTO shift_members(shift_id,user_id,static_id,status) VALUES(?,9101,'9101','booked')", (s2,))
+            checks = {c.name: c for c in await run_health_checks(DummyBot())}
+            assert not checks["Данные смен/отчётов"].ok
+            assert "пересекаются текущие смены" in checks["Данные смен/отчётов"].details
+        finally:
+            await db.close()
+            if os.path.exists(path): os.remove(path)
     asyncio.run(scenario())

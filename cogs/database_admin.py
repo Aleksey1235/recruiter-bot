@@ -30,6 +30,17 @@ def _is_admin_member(member) -> bool:
     return config.ADMIN_ROLE_ID in {role.id for role in getattr(member, "roles", [])}
 
 
+def _department_role_label(member) -> str:
+    role_ids = {role.id for role in getattr(member, "roles", [])}
+    if config.ADMIN_ROLE_ID in role_ids:
+        return "Admin"
+    if config.SENIOR_ROLE_ID in role_ids:
+        return "Senior"
+    if config.RECRUITER_ROLE_ID in role_ids:
+        return "Recruiter"
+    return "Нет роли отдела"
+
+
 def _clip(value, limit=1000):
     text = str(value or "—")
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -74,9 +85,9 @@ async def build_user_embed(member, overview: dict) -> disnake.Embed:
         name="👤 Профиль",
         value=(
             f"Имя в БД: **{_clip(user.get('username'), 100)}**\n"
+            f"Discord ID: `{member.id}`\n"
             f"Статик: **{_clip(user.get('static_id'), 100)}**\n"
-            f"Роль в БД: **{_clip(user.get('role'), 50)}**\n"
-            f"Уровень: **{user.get('level') or 1}** | Варны: **{user.get('warns') or 0}**"
+            f"Роль Discord: **{_department_role_label(member)}**"
         ),
         inline=False,
     )
@@ -116,6 +127,19 @@ async def build_user_embed(member, overview: dict) -> disnake.Embed:
         inline=True,
     )
     embed.add_field(name="🎯 Активных целей", value=str(overview["active_goals"]), inline=True)
+    blacklist = overview.get("blacklist")
+    if blacklist:
+        embed.add_field(
+            name="🚫 Чёрный список",
+            value=(
+                f"🔴 **В ЧС** • запись `#{blacklist['id']}`\n"
+                f"Тег: **{_clip(blacklist['discord_tag'], 100)}** • Discord ID: `{blacklist['discord_id']}`\n"
+                f"Причина: {_clip(blacklist['reason'], 500)}"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="🚫 Чёрный список", value="✅ Активной записи нет.", inline=False)
     if user.get("notes"):
         embed.add_field(name="📝 Последние заметки", value=_clip(user["notes"][-1000:]), inline=False)
     embed.set_footer(text="Кнопки действуют 5 минут. Критичные статусы и деньги меняются только профильными командами.")
@@ -322,7 +346,7 @@ class DatabaseAdmin(commands.Cog):
         for row in rows[:10]:
             embed.add_field(
                 name=f"{_clip(row['username'], 100)} • {_clip(row['static_id'], 50)}",
-                value=f"<@{row['discord_id']}> • `{row['discord_id']}` • DB role: `{row['role']}`",
+                value=f"<@{row['discord_id']}> • Discord ID: `{row['discord_id']}`",
                 inline=False,
             )
         embed.set_footer(text="Для интерактивной карточки используйте /база пользователь @человек")

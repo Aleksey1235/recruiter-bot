@@ -1,6 +1,8 @@
-Recruiter Bot — Production Final
+Recruiter Bot — Production Ultimate Audited
 Build date: 2026-08-25
-Database schema: v3
+Database schema: v4
 Python target: 3.11
 Timezone default: Europe/Moscow
-Test suite: 39 passed x 3 consecutive runs
+Test suite: 65 passed × 3 consecutive runs
+Primary UI: buttons + slash fallback
+Blacklist management: Admin only

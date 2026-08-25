@@ -163,6 +163,25 @@ CREATE TABLE IF NOT EXISTS notifications (
     CHECK (attempts >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS blacklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id INTEGER NOT NULL,
+    discord_tag TEXT NOT NULL,
+    static_id TEXT,
+    full_name TEXT,
+    reason TEXT NOT NULL,
+    evidence TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_by INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    removed_by INTEGER,
+    removed_at TIMESTAMP,
+    remove_reason TEXT,
+    CHECK (discord_id > 0),
+    CHECK (status IN ('active', 'removed'))
+);
+
 """
 
 INDEX_SQL = """
@@ -188,6 +207,14 @@ CREATE INDEX IF NOT EXISTS idx_logs_created
     ON logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_status
     ON notifications(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_blacklist_status_created
+    ON blacklist(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_blacklist_tag
+    ON blacklist(discord_tag);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_blacklist_active_discord
+    ON blacklist(discord_id) WHERE status='active';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_blacklist_active_static
+    ON blacklist(static_id) WHERE status='active' AND static_id IS NOT NULL AND TRIM(static_id)<>'';
 """
 
 
@@ -256,7 +283,7 @@ class Database:
         await self._migrate_additive_columns()
         await self._repair_notification_null_users()
         await self.db.executescript(INDEX_SQL)
-        await self.db.execute("PRAGMA user_version = 3")
+        await self.db.execute("PRAGMA user_version = 4")
         await self.db.commit()
 
     async def _backup_before_migration_if_needed(self):
@@ -266,7 +293,7 @@ class Database:
         version_cursor = await self.db.execute("PRAGMA user_version")
         version_row = await version_cursor.fetchone()
         version = int(version_row[0] if version_row else 0)
-        if version >= 3:
+        if version >= 4:
             return
 
         tables_cursor = await self.db.execute(
@@ -277,7 +304,7 @@ class Database:
             return
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{config.DATABASE_PATH}.pre_v3_{stamp}.db"
+        backup_path = f"{config.DATABASE_PATH}.pre_v4_{stamp}.db"
         target = sqlite3.connect(backup_path)
         try:
             await self.db.backup(target)
@@ -390,6 +417,21 @@ class Database:
                 "last_error": "TEXT",
                 "created_at": "TIMESTAMP",
                 "updated_at": "TIMESTAMP",
+            },
+            "blacklist": {
+                "discord_id": "INTEGER",
+                "discord_tag": "TEXT",
+                "static_id": "TEXT",
+                "full_name": "TEXT",
+                "reason": "TEXT",
+                "evidence": "TEXT",
+                "notes": "TEXT",
+                "status": "TEXT DEFAULT 'active'",
+                "created_by": "INTEGER",
+                "created_at": "TIMESTAMP",
+                "removed_by": "INTEGER",
+                "removed_at": "TIMESTAMP",
+                "remove_reason": "TEXT",
             },
         }
         added_timestamp_columns: list[tuple[str, str]] = []
@@ -621,13 +663,12 @@ async def notify(bot, user_id: int, notif_type: str, object_type: str, object_id
     return success
 
 
-async def reserve_system_marker(notif_type: str, object_type: str, object_id: int) -> bool:
+async def reserve_system_marker(
+    notif_type: str, object_type: str, object_id: int, max_attempts: int | None = None
+) -> bool:
+    attempts = max_attempts if max_attempts is not None else max(config.MAX_NOTIFICATION_ATTEMPTS, 10)
     return await _reserve_notification(
-        0,
-        notif_type,
-        object_type,
-        object_id,
-        config.MAX_NOTIFICATION_ATTEMPTS,
+        0, notif_type, object_type, object_id, attempts
     )
 
 

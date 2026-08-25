@@ -31,21 +31,23 @@ def setup_logging():
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    file_handler = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
+    try:
+        file_handler = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        root.warning("Не удалось открыть bot.log: %s. Продолжаем с консольным логом.", exc)
     root._recruiter_bot_logging = True
 
 
 logger = logging.getLogger(__name__)
 
 
-class Bot(commands.Bot):
+class Bot(commands.InteractionBot):
     def __init__(self):
         intents = disnake.Intents.default()
         intents.members = True
         super().__init__(
-            command_prefix="!",
             intents=intents,
             test_guilds=[config.GUILD_ID],
         )
@@ -101,6 +103,7 @@ async def main():
     cogs = [
         "cogs.shifts",
         "cogs.invites",
+        "cogs.blacklist",
         "cogs.statistics",
         "cogs.finance",
         "cogs.goals",

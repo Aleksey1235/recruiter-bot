@@ -55,7 +55,7 @@ class Tasks(commands.Cog):
             FROM shift_members sm
             JOIN shifts s ON s.id=sm.shift_id
             WHERE sm.status IN ('booked', 'active')
-              AND s.status<>'cancelled'
+              AND s.status IN ('open','booked','active')
             """
         )
         for member in members:

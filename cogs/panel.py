@@ -9,11 +9,15 @@ import config
 from cogs.invites import build_invite_view, sync_invite_review_message
 from cogs.shifts import FinishShiftModal, LeaveShiftModal, ResubmitReportModal, publish_shift_message, sync_report_review_message, update_shift_message
 from database.db import db, ensure_user, log, notify
-from services import database_service, finance_service, goal_service, invite_service, shift_service, statistics_service
+from services import blacklist_service, database_service, finance_service, goal_service, invite_service, shift_service, statistics_service
 from services.errors import UserFacingError
-from services.health_service import run_health_checks
+from services.health_service import (
+    get_blacklist_anomalies, get_domain_anomalies, get_finance_anomalies,
+    get_notification_anomalies, get_shift_anomalies, repair_safe_domain_anomalies, run_health_checks,
+)
 from utils.checks import is_recruiter_or_higher, is_senior_or_admin
 from utils.formatting import money, normalize_amount
+from utils.discord_helpers import send_control_warning
 from utils.embeds import EmbedGenerator
 from utils.time_utils import local_now, parse_db, utc_now, format_utc_db
 
@@ -47,7 +51,7 @@ def _panel_embed() -> disnake.Embed:
     )
     embed.add_field(
         name="🛡️ Управление",
-        value="Старший состав и администраторы открывают свои разделы отдельными кнопками.",
+        value="Старший состав: смены • отчёты • статистика. Admin: ЧС • база • финансы.",
         inline=False,
     )
     embed.set_footer(text=PANEL_FOOTER)
@@ -426,6 +430,14 @@ class InviteIdentityModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         if not is_recruiter_or_higher(inter.author):
             return await inter.response.send_message("❌ Панель доступна только действующим рекрутерам и старшему составу.", ephemeral=True)
+        try:
+            await invite_service.assert_target_not_blacklisted(
+                self.target.id, inter.text_values["static"].strip(), inter.author.id, "BLACKLIST_BLOCK_INVITE"
+            )
+        except UserFacingError as exc:
+            return await inter.response.send_message(
+                "🚫 **ИНВАЙТ ЗАБЛОКИРОВАН**\n" + str(exc), ephemeral=True
+            )
         view = InviteChecklistView(
             inter.bot,
             inter.author.id,
@@ -511,7 +523,7 @@ class InviteChecklistView(disnake.ui.View):
 
     def render_state(self, invalid: bool = False) -> str:
         lines = [
-            f"👤 **Приглашённый:** {self.target.mention}",
+            f"👤 **Приглашённый:** {self.target.mention} • Discord ID: `{self.target.id}`",
             f"🆔 **Статик:** `{self.static_id}`",
             f"📛 **Имя:** {self.full_name}",
             "",
@@ -583,10 +595,10 @@ class InviteChecklistView(disnake.ui.View):
         if channel:
             try:
                 embed = disnake.Embed(title="👤 НОВЫЙ ИНВАЙТ", color=disnake.Color.blue())
-                embed.add_field(name="Приглашённый", value=self.target.mention, inline=True)
+                embed.add_field(name="Приглашённый", value=f"{self.target.mention}\nDiscord ID: `{self.target.id}`", inline=True)
                 embed.add_field(name="Статик", value=self.static_id, inline=True)
                 embed.add_field(name="Имя", value=self.full_name, inline=True)
-                embed.add_field(name="Рекрутер", value=inter.author.mention, inline=True)
+                embed.add_field(name="Рекрутер", value=f"{inter.author.mention}\nDiscord ID: `{inter.author.id}`", inline=True)
                 checklist_text = (
                     f"Тикет: {'✅' if checklist['ticket']=='yes' else '❌'}\n"
                     f"Фамилия: {'✅' if checklist['last_name']=='yes' else '❌'}\n"
@@ -601,15 +613,23 @@ class InviteChecklistView(disnake.ui.View):
                     embed=embed,
                     view=build_invite_view(invite_id),
                 )
-                await invite_service.set_invite_message_id(invite_id, message.id)
                 posted = True
+                try:
+                    await invite_service.set_invite_message_id(invite_id, message.id)
+                except Exception:
+                    logger.exception("Карточка инвайта #%s создана, но message_id не сохранён", invite_id)
             except Exception:
                 logger.exception("Не удалось отправить карточку инвайта #%s", invite_id)
         if posted:
             text = f"✅ Отчёт создан и отправлен на проверку. ID: **#{invite_id}**"
         else:
+            warned = await send_control_warning(
+                inter.guild,
+                f"⚠️ <@&{config.SENIOR_ROLE_ID}> инвайт **#{invite_id}** сохранён в БД, но публичная карточка "
+                "не была создана. Проверьте инвайт через панель руководства.",
+            )
             text = (f"⚠️ Инвайт **#{invite_id}** сохранён в базе, но карточку в канал отчётов отправить не удалось. "
-                    "Сообщите старшему составу.")
+                    + ("Старший состав уведомлён." if warned else "Откройте панель руководства и сообщите старшему составу."))
         await inter.edit_original_response(content=text, view=None)
 
 
@@ -970,15 +990,24 @@ class ApproveReportByIdModal(disnake.ui.Modal):
             return await inter.response.send_message("❌ Доступ только старшему составу.", ephemeral=True)
         try:
             report_id = int(inter.text_values["id"].strip())
+        except ValueError:
+            return await inter.response.send_message("❌ ID отчёта должен быть числом.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
             report = await shift_service.approve_report(report_id, inter.author.id)
-        except (ValueError, UserFacingError) as exc:
-            return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
         dm = disnake.Embed(title="✅ ВАШ ОТЧЁТ ОДОБРЕН", color=disnake.Color.green())
         dm.add_field(name="📋 Смена", value=f"#{report['shift_id']}", inline=True)
         dm.add_field(name="👥 Принято", value=str(report["total_accepted"]), inline=True)
-        await notify(inter.bot, report["user_id"], "REPORT_APPROVED", "shift_report", report_id, embed=dm)
-        await sync_report_review_message(inter.guild, report_id, True, inter.author.mention)
-        await inter.response.send_message(f"✅ Отчёт **#{report_id}** одобрен.", ephemeral=True)
+        dm_sent = await notify(inter.bot, report["user_id"], "REPORT_APPROVED", "shift_report", report_id, embed=dm)
+        synced = await sync_report_review_message(inter.guild, report_id, True, inter.author.mention)
+        warnings=[]
+        if not synced: warnings.append("публичная карточка не обновилась")
+        if not dm_sent: warnings.append("ЛС рекрутеру не доставлено")
+        text=f"✅ Отчёт **#{report_id}** одобрен."
+        if warnings: text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
 
 class RejectReportByIdModal(disnake.ui.Modal):
@@ -992,15 +1021,25 @@ class RejectReportByIdModal(disnake.ui.Modal):
             return await inter.response.send_message("❌ Доступ только старшему составу.", ephemeral=True)
         try:
             report_id = int(inter.text_values["id"].strip())
-            report = await shift_service.reject_report(report_id, inter.author.id, inter.text_values["reason"])
-        except (ValueError, UserFacingError) as exc:
-            return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+        except ValueError:
+            return await inter.response.send_message("❌ ID отчёта должен быть числом.", ephemeral=True)
+        reason=inter.text_values["reason"]
+        await inter.response.defer(ephemeral=True)
+        try:
+            report = await shift_service.reject_report(report_id, inter.author.id, reason)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
         dm = disnake.Embed(title="❌ ВАШ ОТЧЁТ ОТКЛОНЁН", color=disnake.Color.red())
         dm.add_field(name="📋 Смена", value=f"#{report['shift_id']}", inline=True)
-        dm.add_field(name="📝 Причина", value=inter.text_values["reason"], inline=False)
-        await notify(inter.bot, report["user_id"], "REPORT_REJECTED", "shift_report", report_id, embed=dm)
-        await sync_report_review_message(inter.guild, report_id, False, inter.author.mention, inter.text_values["reason"])
-        await inter.response.send_message(f"✅ Отчёт **#{report_id}** отклонён.", ephemeral=True)
+        dm.add_field(name="📝 Причина", value=reason, inline=False)
+        dm_sent = await notify(inter.bot, report["user_id"], "REPORT_REJECTED", "shift_report", report_id, embed=dm)
+        synced = await sync_report_review_message(inter.guild, report_id, False, inter.author.mention, reason)
+        warnings=[]
+        if not synced: warnings.append("публичная карточка не обновилась")
+        if not dm_sent: warnings.append("ЛС рекрутеру не доставлено")
+        text=f"✅ Отчёт **#{report_id}** отклонён."
+        if warnings: text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
 
 class PendingReportSelect(disnake.ui.StringSelect):
@@ -1088,14 +1127,26 @@ class InviteApproveByIdModal(disnake.ui.Modal):
         if not is_senior_or_admin(inter.author):
             return await inter.response.send_message("❌ Доступ только старшему составу.", ephemeral=True)
         try:
-            invite_id = int(inter.text_values["id"].strip())
-            amount = normalize_amount(inter.text_values["amount"])
-            invite, _ = await invite_service.approve_invite(invite_id, inter.author.id, amount)
-        except (ValueError, UserFacingError) as exc: return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
-        dm=disnake.Embed(title="✅ ИНВАЙТ ОДОБРЕН", color=disnake.Color.green()); dm.add_field(name="Статик", value=invite["static_id"]); dm.add_field(name="Начислено", value=money(amount)) if amount>0 else None
-        await notify(inter.bot, invite["invited_by"], "INVITE_APPROVED", "invite", invite_id, embed=dm)
-        await sync_invite_review_message(inter.guild, invite_id, True, inter.author.mention, amount)
-        await inter.response.send_message(f"✅ Инвайт **#{invite_id}** принят.", ephemeral=True)
+            invite_id=int(inter.text_values["id"].strip())
+            amount=normalize_amount(inter.text_values["amount"])
+        except ValueError as exc:
+            return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            invite,_=await invite_service.approve_invite(invite_id, inter.author.id, amount)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        dm=disnake.Embed(title="✅ ИНВАЙТ ОДОБРЕН", color=disnake.Color.green())
+        dm.add_field(name="Статик", value=invite["static_id"])
+        if amount>0: dm.add_field(name="Начислено", value=money(amount))
+        dm_sent=await notify(inter.bot, invite["invited_by"], "INVITE_APPROVED", "invite", invite_id, embed=dm)
+        synced=await sync_invite_review_message(inter.guild, invite_id, True, inter.author.mention, amount)
+        warnings=[]
+        if not synced: warnings.append("публичная карточка не обновилась")
+        if not dm_sent: warnings.append("ЛС рекрутеру не доставлено")
+        text=f"✅ Инвайт **#{invite_id}** принят."
+        if warnings: text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
 
 class InviteRejectByIdModal(disnake.ui.Modal):
@@ -1108,12 +1159,26 @@ class InviteRejectByIdModal(disnake.ui.Modal):
         if not is_senior_or_admin(inter.author):
             return await inter.response.send_message("❌ Доступ только старшему составу.", ephemeral=True)
         try:
-            invite_id=int(inter.text_values["id"].strip()); invite=await invite_service.reject_invite(invite_id, inter.author.id, inter.text_values["reason"])
-        except (ValueError, UserFacingError) as exc: return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
-        dm=disnake.Embed(title="❌ ИНВАЙТ ОТКЛОНЁН", color=disnake.Color.red()); dm.add_field(name="Статик", value=invite["static_id"]); dm.add_field(name="Причина", value=inter.text_values["reason"], inline=False)
-        await notify(inter.bot, invite["invited_by"], "INVITE_REJECTED", "invite", invite_id, embed=dm)
-        await sync_invite_review_message(inter.guild, invite_id, False, inter.author.mention, reason=inter.text_values["reason"])
-        await inter.response.send_message(f"✅ Инвайт **#{invite_id}** отклонён.", ephemeral=True)
+            invite_id=int(inter.text_values["id"].strip())
+        except ValueError:
+            return await inter.response.send_message("❌ ID инвайта должен быть числом.", ephemeral=True)
+        reason=inter.text_values["reason"]
+        await inter.response.defer(ephemeral=True)
+        try:
+            invite=await invite_service.reject_invite(invite_id, inter.author.id, reason)
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        dm=disnake.Embed(title="❌ ИНВАЙТ ОТКЛОНЁН", color=disnake.Color.red())
+        dm.add_field(name="Статик", value=invite["static_id"])
+        dm.add_field(name="Причина", value=reason, inline=False)
+        dm_sent=await notify(inter.bot, invite["invited_by"], "INVITE_REJECTED", "invite", invite_id, embed=dm)
+        synced=await sync_invite_review_message(inter.guild, invite_id, False, inter.author.mention, reason=reason)
+        warnings=[]
+        if not synced: warnings.append("публичная карточка не обновилась")
+        if not dm_sent: warnings.append("ЛС рекрутеру не доставлено")
+        text=f"✅ Инвайт **#{invite_id}** отклонён."
+        if warnings: text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
+        await inter.edit_original_response(content=text)
 
 
 class InviteLookupModal(disnake.ui.Modal):
@@ -1132,12 +1197,20 @@ class InviteLookupModal(disnake.ui.Modal):
             else: rows=await db.fetchall("SELECT * FROM invites WHERE status='accepted' ORDER BY created_at DESC LIMIT 20")
             em=disnake.Embed(title="📋 БАЗА ПРИНЯТЫХ", color=disnake.Color.blue())
             if not rows: em.description="Ничего не найдено."
-            for r in rows: em.add_field(name=f"{r['static_id']} • {r['full_name'] or '—'}", value=f"Рекрутер: <@{r['invited_by']}>", inline=False)
+            for r in rows:
+                target=f"<@{r['user_id']}> • ID: `{r['user_id']}`" if r["user_id"] else "Discord не привязан"
+                blocked=await blacklist_service.get_active_match(r["user_id"],r["static_id"])
+                marker=f"\n🚫 Сейчас в ЧС: запись #{blocked['id']}" if blocked else ""
+                em.add_field(name=f"{r['static_id']} • {r['full_name'] or '—'}", value=f"Discord: {target}\nРекрутер: <@{r['invited_by']}> • ID: `{r['invited_by']}`{marker}", inline=False)
             return await inter.response.send_message(embed=em, ephemeral=True)
         inv=await db.fetchone("SELECT * FROM invites WHERE static_id=? ORDER BY id DESC LIMIT 1",(static,))
         if not inv: return await inter.response.send_message("❌ Статик не найден.", ephemeral=True)
         if self.mode=="info":
-            em=disnake.Embed(title=f"👤 {static}", color=disnake.Color.blue()); em.add_field(name="Имя",value=inv['full_name'] or '—'); em.add_field(name="Статус",value=inv['status']); em.add_field(name="Рекрутер",value=f"<@{inv['invited_by']}>"); em.add_field(name="Заметки",value=(inv['notes'] or '—')[-1000:],inline=False)
+            em=disnake.Embed(title=f"👤 {static}", color=disnake.Color.blue())
+            target=f"<@{inv['user_id']}> • ID: `{inv['user_id']}`" if inv["user_id"] else "Discord не привязан (legacy-запись)"
+            em.add_field(name="Discord",value=target,inline=False); em.add_field(name="Имя",value=inv['full_name'] or '—'); em.add_field(name="Статус",value=inv['status']); em.add_field(name="Рекрутер",value=f"<@{inv['invited_by']}> • ID: `{inv['invited_by']}`"); em.add_field(name="Заметки",value=(inv['notes'] or '—')[-1000:],inline=False)
+            blocked=await blacklist_service.get_active_match(inv["user_id"],inv["static_id"])
+            if blocked: em.add_field(name="🚫 Чёрный список",value=f"Запись **#{blocked['id']}**\n{_blacklist_identity(blocked)}\nПричина: {(blocked['reason'] or '—')[:700]}",inline=False)
             return await inter.response.send_message(embed=em, ephemeral=True)
         try:
             await invite_service.add_invite_note(inv["id"], inter.text_values["note"], inter.author.id, inter.author.name)
@@ -1163,8 +1236,10 @@ class PendingInviteSelect(disnake.ui.StringSelect):
         inv = await db.fetchone("SELECT * FROM invites WHERE id=? AND status='pending'", (invite_id,))
         if not inv:
             return await inter.response.send_message("❌ Инвайт уже обработан или не найден.", ephemeral=True)
-        embed = disnake.Embed(title="👤 ИНВАЙТ НА ПРОВЕРКЕ", color=disnake.Color.yellow())
-        embed.add_field(name="Приглашённый", value=f"<@{inv['user_id']}>", inline=True)
+        blocked=await blacklist_service.get_active_match(inv["user_id"],inv["static_id"])
+        embed = disnake.Embed(title="🚫 ИНВАЙТ ЗАБЛОКИРОВАН ЧС" if blocked else "👤 ИНВАЙТ НА ПРОВЕРКЕ", color=disnake.Color.red() if blocked else disnake.Color.yellow())
+        target=f"<@{inv['user_id']}> • ID: `{inv['user_id']}`" if inv["user_id"] else "Discord не привязан (legacy-запись)"
+        embed.add_field(name="Приглашённый", value=target, inline=False)
         embed.add_field(name="Статик", value=inv["static_id"], inline=True)
         embed.add_field(name="Имя", value=inv["full_name"] or "—", inline=True)
         embed.add_field(name="Рекрутер", value=f"<@{inv['invited_by']}>", inline=True)
@@ -1176,8 +1251,10 @@ class PendingInviteSelect(disnake.ui.StringSelect):
             f"📢 Инфо: {'✅' if inv['info']=='yes' else '❌'}"
         )
         embed.add_field(name="📋 Чек-лист", value=checklist, inline=False)
+        if blocked:
+            embed.add_field(name="🚫 Причина блокировки",value=f"ЧС **#{blocked['id']}** • {_blacklist_identity(blocked)}\n{(blocked['reason'] or '—')[:800]}",inline=False)
         embed.set_footer(text=f"Инвайт #{invite_id}")
-        await inter.response.send_message(embed=embed, view=build_invite_view(invite_id), ephemeral=True)
+        await inter.response.send_message(embed=embed, view=build_invite_view(invite_id,accept_disabled=bool(blocked)), ephemeral=True)
 
 
 class PendingInviteSelectView(disnake.ui.View):
@@ -1313,9 +1390,11 @@ class GoalValueModal(disnake.ui.Modal):
             )
         except UserFacingError as exc:
             return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+        current = await goal_service.calculate_progress(self.target.id, self.goal_type, self.period)
         dm = disnake.Embed(title="🎯 ВАМ ПОСТАВЛЕНА НОВАЯ ЦЕЛЬ", color=disnake.Color.blue())
         dm.add_field(name="Цель", value=f"{self.goal_type}: {value}")
         dm.add_field(name="Период", value=self.period)
+        dm.add_field(name="Прогресс", value=f"{current} / {value}")
         await notify(self.bot, self.target.id, "GOAL_SET", "goal", gid, embed=dm)
         await inter.response.send_message(f"✅ Цель поставлена для {self.target.mention}.", ephemeral=True)
 
@@ -1388,10 +1467,14 @@ class FinanceAccrueModal(disnake.ui.Modal):
     async def callback(self,inter):
         if not _is_admin(inter.author):
             return await inter.response.send_message("❌ Доступ только администратору.", ephemeral=True)
-        try: fid,balance=await finance_service.accrue(self.target.id,self.target.name,inter.text_values['amount'],inter.text_values.get('reason',''),inter.author.id)
+        if not is_recruiter_or_higher(self.target):
+            return await inter.response.send_message("❌ Пользователь больше не относится к рекрутерам/старшему составу.", ephemeral=True)
+        try:
+            amount=normalize_amount(inter.text_values['amount'])
+            fid,balance=await finance_service.accrue(self.target.id,self.target.name,amount,inter.text_values.get('reason',''),inter.author.id)
         except (UserFacingError,ValueError) as exc: return await inter.response.send_message(f"❌ {exc}",ephemeral=True)
-        dm=disnake.Embed(title="💰 ВАМ НАЧИСЛЕНЫ ДЕНЬГИ",color=disnake.Color.green()); dm.add_field(name="Сумма",value=money(inter.text_values['amount'])); dm.add_field(name="К выплате",value=money(balance[2])); await notify(self.bot,self.target.id,"FIN_ACCRUE","finance",fid,embed=dm)
-        await inter.response.send_message(f"✅ Начислено {money(inter.text_values['amount'])} для {self.target.mention}.",ephemeral=True)
+        dm=disnake.Embed(title="💰 ВАМ НАЧИСЛЕНЫ ДЕНЬГИ",color=disnake.Color.green()); dm.add_field(name="Сумма",value=money(amount)); dm.add_field(name="К выплате",value=money(balance[2])); await notify(self.bot,self.target.id,"FIN_ACCRUE","finance",fid,embed=dm)
+        await inter.response.send_message(f"✅ Начислено {money(amount)} для {self.target.mention}.",ephemeral=True)
 
 
 class FinancePayModal(disnake.ui.Modal):
@@ -1399,10 +1482,14 @@ class FinancePayModal(disnake.ui.Modal):
     async def callback(self,inter):
         if not _is_admin(inter.author):
             return await inter.response.send_message("❌ Доступ только администратору.", ephemeral=True)
-        try: fid,balance=await finance_service.pay(self.target.id,self.target.name,inter.text_values['amount'],inter.author.id)
+        if not is_recruiter_or_higher(self.target):
+            return await inter.response.send_message("❌ Пользователь больше не относится к рекрутерам/старшему составу.", ephemeral=True)
+        try:
+            amount=normalize_amount(inter.text_values['amount'])
+            fid,balance=await finance_service.pay(self.target.id,self.target.name,amount,inter.author.id)
         except (UserFacingError,ValueError) as exc: return await inter.response.send_message(f"❌ {exc}",ephemeral=True)
-        dm=disnake.Embed(title="💸 ЗАРПЛАТА ВЫПЛАЧЕНА",color=disnake.Color.blue()); dm.add_field(name="Сумма",value=money(inter.text_values['amount'])); dm.add_field(name="Остаток",value=money(balance[2])); await notify(self.bot,self.target.id,"FIN_PAY","finance",fid,embed=dm)
-        await inter.response.send_message(f"✅ Выплачено {money(inter.text_values['amount'])} для {self.target.mention}.",ephemeral=True)
+        dm=disnake.Embed(title="💸 ЗАРПЛАТА ВЫПЛАЧЕНА",color=disnake.Color.blue()); dm.add_field(name="Сумма",value=money(amount)); dm.add_field(name="Остаток",value=money(balance[2])); await notify(self.bot,self.target.id,"FIN_PAY","finance",fid,embed=dm)
+        await inter.response.send_message(f"✅ Выплачено {money(amount)} для {self.target.mention}.",ephemeral=True)
 
 
 class AdminFinanceMenuView(disnake.ui.View):
@@ -1421,6 +1508,265 @@ class AdminFinanceMenuView(disnake.ui.View):
     @disnake.ui.button(label="🛠️ Исправить кеш",style=disnake.ButtonStyle.danger,row=1)
     async def fix(self,b,i):
         mismatches=await finance_service.reconcile_all(True); await i.response.send_message(f"✅ Сверка завершена. Исправлено профилей: **{len(mismatches)}**.",ephemeral=True)
+
+
+def _blacklist_identity(row) -> str:
+    return f"<@{row['discord_id']}> • Discord ID: `{row['discord_id']}`\nТег: **{row['discord_tag']}**"
+
+
+def _blacklist_entry_embed(row, title: str | None = None) -> disnake.Embed:
+    active = row["status"] == "active"
+    em = disnake.Embed(
+        title=title or ("🚫 ЧЁРНЫЙ СПИСОК" if active else "📜 ИСТОРИЯ ЧС"),
+        color=disnake.Color.red() if active else disnake.Color.dark_grey(),
+    )
+    em.add_field(name="👤 Discord", value=_blacklist_identity(row), inline=False)
+    em.add_field(name="🆔 Статик", value=row["static_id"] or "—", inline=True)
+    em.add_field(name="📛 Имя / фамилия", value=row["full_name"] or "—", inline=True)
+    em.add_field(name="📌 Причина", value=(row["reason"] or "—")[:1000], inline=False)
+    if row["evidence"]:
+        em.add_field(name="🔗 Доказательство", value=row["evidence"][:1000], inline=False)
+    if row["notes"]:
+        em.add_field(name="📝 Заметка", value=row["notes"][:1000], inline=False)
+    em.add_field(name="👮 Добавил", value=f"<@{row['created_by']}> • ID: `{row['created_by']}`", inline=True)
+    em.add_field(name="📅 Добавлен", value=format_utc_db(row["created_at"]), inline=True)
+    em.add_field(name="Статус", value="🔴 Активный ЧС" if active else "⚪ Снят с ЧС", inline=True)
+    if not active:
+        em.add_field(name="👑 Снял", value=f"<@{row['removed_by']}> • ID: `{row['removed_by']}`", inline=True)
+        em.add_field(name="📅 Снят", value=format_utc_db(row["removed_at"]), inline=True)
+        em.add_field(name="Причина снятия", value=row["remove_reason"] or "—", inline=False)
+    em.set_footer(text=f"Запись ЧС #{row['id']}")
+    return em
+
+
+def _blacklist_list_embed(rows, title: str, history: bool = False) -> disnake.Embed:
+    em = disnake.Embed(title=title, color=disnake.Color.dark_grey() if history else disnake.Color.dark_red())
+    if not rows:
+        em.description = "Записей нет."
+        return em
+    lines = []
+    for row in rows:
+        status = "🔴" if row["status"] == "active" else "⚪"
+        lines.append(
+            f"{status} `#{row['id']}` • **{row['discord_tag']}** • Discord ID: `{row['discord_id']}`\n"
+            f"   Статик: **{row['static_id'] or '—'}** • {(row['reason'] or '—')[:110]}"
+        )
+    em.description = "\n".join(lines)[:3900]
+    return em
+
+
+class BlacklistAddModal(disnake.ui.Modal):
+    def __init__(self, user):
+        self.user = user
+        super().__init__(
+            title="🚫 Добавить в ЧС",
+            custom_id=f"panel:blacklist_add:{user.id}",
+            components=[
+                disnake.ui.TextInput(label="Статик (если известен)", custom_id="static", required=False, max_length=config.MAX_STATIC_ID_LENGTH),
+                disnake.ui.TextInput(label="Имя и фамилия", custom_id="full_name", required=False, max_length=100, value=user.display_name[:100]),
+                disnake.ui.TextInput(label="Причина", custom_id="reason", required=True, max_length=1000, style=disnake.TextInputStyle.paragraph),
+                disnake.ui.TextInput(label="Доказательство / ссылка", custom_id="evidence", required=False, max_length=1500),
+                disnake.ui.TextInput(label="Заметка", custom_id="notes", required=False, max_length=2000, style=disnake.TextInputStyle.paragraph),
+            ],
+        )
+
+    async def callback(self, inter):
+        if not _is_admin(inter.author):
+            return await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
+        if getattr(self.user, "bot", False):
+            return await inter.response.send_message("❌ Нельзя добавить бота в ЧС.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            row = await blacklist_service.add_entry(
+                self.user.id,
+                str(self.user),
+                inter.text_values["static"],
+                inter.text_values["full_name"],
+                inter.text_values["reason"],
+                inter.text_values["evidence"],
+                inter.text_values["notes"],
+                inter.author.id,
+            )
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        await inter.edit_original_response(embed=_blacklist_entry_embed(row, "🚫 ДОБАВЛЕН В ЧС"))
+
+
+class BlacklistUserSelect(disnake.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Выберите пользователя Discord", min_values=1, max_values=1)
+
+    async def callback(self, inter):
+        user = self.values[0]
+        if user.id == inter.author.id:
+            # Самого себя блокировать технически можно, но почти всегда это ошибка интерфейса.
+            return await inter.response.send_message("❌ Нельзя добавить самого себя в ЧС через это меню.", ephemeral=True)
+        await inter.response.send_modal(BlacklistAddModal(user))
+
+
+class BlacklistUserSelectView(disnake.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.add_item(BlacklistUserSelect())
+
+    async def interaction_check(self, inter):
+        if inter.author.id != self.user_id:
+            await inter.response.send_message("❌ Это не ваше меню.", ephemeral=True)
+            return False
+        if not _is_admin(inter.author):
+            await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
+            return False
+        return True
+
+
+class BlacklistManualAddModal(disnake.ui.Modal):
+    def __init__(self):
+        super().__init__(
+            title="🚫 Добавить в ЧС по Discord ID",
+            components=[
+                disnake.ui.TextInput(label="Discord ID", custom_id="discord_id", required=True, max_length=20),
+                disnake.ui.TextInput(label="Discord-тег / имя", custom_id="tag", required=True, max_length=100),
+                disnake.ui.TextInput(label="Статик (если известен)", custom_id="static", required=False, max_length=config.MAX_STATIC_ID_LENGTH),
+                disnake.ui.TextInput(label="Имя и фамилия", custom_id="full_name", required=False, max_length=100),
+                disnake.ui.TextInput(label="Причина", custom_id="reason", required=True, max_length=1000, style=disnake.TextInputStyle.paragraph),
+            ],
+        )
+
+    async def callback(self, inter):
+        if not _is_admin(inter.author):
+            return await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            discord_id = int(inter.text_values["discord_id"].strip())
+        except ValueError:
+            return await inter.edit_original_response(content="❌ Discord ID должен состоять только из цифр.")
+        try:
+            row = await blacklist_service.add_entry(
+                discord_id,
+                inter.text_values["tag"],
+                inter.text_values["static"],
+                inter.text_values["full_name"],
+                inter.text_values["reason"],
+                None,
+                None,
+                inter.author.id,
+            )
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        await inter.edit_original_response(embed=_blacklist_entry_embed(row, "🚫 ДОБАВЛЕН В ЧС"))
+
+
+class BlacklistDetailsModal(disnake.ui.Modal):
+    def __init__(self):
+        super().__init__(title="📝 Дополнить запись ЧС",components=[
+            disnake.ui.TextInput(label="ID записи ЧС",custom_id="id",required=True,max_length=10),
+            disnake.ui.TextInput(label="Доказательство / ссылка",custom_id="evidence",required=False,max_length=1500),
+            disnake.ui.TextInput(label="Добавить заметку",custom_id="note",required=False,max_length=1000,style=disnake.TextInputStyle.paragraph),
+        ])
+    async def callback(self,inter):
+        if not _is_admin(inter.author):
+            return await inter.response.send_message("❌ Чёрный список доступен только Admin.",ephemeral=True)
+        try: entry_id=int(inter.text_values["id"].strip())
+        except ValueError: return await inter.response.send_message("❌ ID записи должен быть числом.",ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            row=await blacklist_service.update_entry_details(entry_id,inter.author.id,inter.text_values.get("evidence"),inter.text_values.get("note"))
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        await inter.edit_original_response(embed=_blacklist_entry_embed(row,"📝 ЗАПИСЬ ЧС ОБНОВЛЕНА"))
+
+
+class BlacklistSearchModal(disnake.ui.Modal):
+    def __init__(self):
+        super().__init__(
+            title="🔎 Поиск по ЧС",
+            components=[disnake.ui.TextInput(label="Discord ID / статик / тег / имя", custom_id="query", required=True, max_length=100)],
+        )
+
+    async def callback(self, inter):
+        if not _is_admin(inter.author):
+            return await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
+        try:
+            rows = await blacklist_service.search_entries(inter.text_values["query"], include_removed=True, limit=20)
+        except UserFacingError as exc:
+            return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
+        if len(rows) == 1:
+            return await inter.response.send_message(embed=_blacklist_entry_embed(rows[0]), ephemeral=True)
+        await inter.response.send_message(embed=_blacklist_list_embed(rows, "🔎 ПОИСК ПО ЧС", history=True), ephemeral=True)
+
+
+class BlacklistRemoveModal(disnake.ui.Modal):
+    def __init__(self):
+        super().__init__(
+            title="♻️ Снять с ЧС",
+            components=[
+                disnake.ui.TextInput(label="ID записи ЧС", custom_id="id", required=True, max_length=10),
+                disnake.ui.TextInput(label="Причина снятия", custom_id="reason", required=True, max_length=1000, style=disnake.TextInputStyle.paragraph),
+            ],
+        )
+
+    async def callback(self, inter):
+        if not _is_admin(inter.author):
+            return await inter.response.send_message("❌ Снимать с ЧС может только Admin.", ephemeral=True)
+        try:
+            entry_id = int(inter.text_values["id"])
+        except ValueError:
+            return await inter.response.send_message("❌ ID записи должен быть числом.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            row = await blacklist_service.remove_entry(entry_id, inter.author.id, inter.text_values["reason"])
+        except UserFacingError as exc:
+            return await inter.edit_original_response(content=f"❌ {exc}")
+        await inter.edit_original_response(embed=_blacklist_entry_embed(row, "✅ СНЯТ С ЧС"))
+
+
+class BlacklistMenuView(disnake.ui.View):
+    def __init__(self, user_id: int, admin: bool):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.admin = admin
+
+    async def interaction_check(self, inter):
+        if inter.author.id != self.user_id:
+            await inter.response.send_message("❌ Это не ваше меню.", ephemeral=True)
+            return False
+        if not _is_admin(inter.author):
+            await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="➕ Добавить", style=disnake.ButtonStyle.danger, row=0)
+    async def add(self, button, inter):
+        await inter.response.send_message("Выберите пользователя Discord:", view=BlacklistUserSelectView(inter.author.id), ephemeral=True)
+
+    @disnake.ui.button(label="🆔 Добавить по ID", style=disnake.ButtonStyle.secondary, row=0)
+    async def add_id(self, button, inter):
+        await inter.response.send_modal(BlacklistManualAddModal())
+
+    @disnake.ui.button(label="🔎 Найти", style=disnake.ButtonStyle.primary, row=1)
+    async def search(self, button, inter):
+        await inter.response.send_modal(BlacklistSearchModal())
+
+    @disnake.ui.button(label="📋 Активный ЧС", style=disnake.ButtonStyle.primary, row=1)
+    async def active(self, button, inter):
+        rows = await blacklist_service.list_active(25)
+        await inter.response.send_message(embed=_blacklist_list_embed(rows, "🚫 АКТИВНЫЙ ЧЁРНЫЙ СПИСОК"), ephemeral=True)
+
+    @disnake.ui.button(label="📜 История", style=disnake.ButtonStyle.secondary, row=1)
+    async def history(self, button, inter):
+        rows = await blacklist_service.list_history(25)
+        await inter.response.send_message(embed=_blacklist_list_embed(rows, "📜 ИСТОРИЯ ЧЁРНОГО СПИСКА", history=True), ephemeral=True)
+
+    @disnake.ui.button(label="📝 Дополнить", style=disnake.ButtonStyle.secondary, row=2)
+    async def details(self,button,inter):
+        await inter.response.send_modal(BlacklistDetailsModal())
+
+    @disnake.ui.button(label="♻️ Снять с ЧС", style=disnake.ButtonStyle.success, custom_id="panel:blacklist_remove", row=2)
+    async def remove(self, button, inter):
+        if not _is_admin(inter.author):
+            return await inter.response.send_message("❌ Снимать с ЧС может только Admin.", ephemeral=True)
+        await inter.response.send_modal(BlacklistRemoveModal())
 
 
 class DatabaseSearchModal(disnake.ui.Modal):
@@ -1445,18 +1791,119 @@ class FinanceOperationModal(disnake.ui.Modal):
         em=disnake.Embed(title=f"💰 ОПЕРАЦИЯ #{fid}",color=disnake.Color.green()); em.add_field(name="Пользователь",value=f"<@{r['user_id']}>"); em.add_field(name="Сумма",value=money(r['amount'])); em.add_field(name="Тип / статус",value=f"{r['type']} / {r['status']}"); em.add_field(name="Причина",value=r['reason'] or '—',inline=False); await inter.response.send_message(embed=em,ephemeral=True)
 
 
-class AdminDatabaseMenuView(disnake.ui.View):
-    def __init__(self,user_id): super().__init__(timeout=300); self.user_id=user_id
-    async def interaction_check(self,inter):
-        if inter.author.id!=self.user_id: await inter.response.send_message("❌ Это не ваше меню.",ephemeral=True); return False
-        if not _is_admin(inter.author): await inter.response.send_message("❌ Доступ только администратору.",ephemeral=True); return False
+class DomainRepairView(disnake.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    async def interaction_check(self, inter):
+        if inter.author.id != self.user_id:
+            await inter.response.send_message("❌ Это не ваше меню.", ephemeral=True)
+            return False
+        if not _is_admin(inter.author):
+            await inter.response.send_message("❌ Доступ только администратору.", ephemeral=True)
+            return False
         return True
-    @disnake.ui.button(label="👤 Карточка пользователя",style=disnake.ButtonStyle.primary)
-    async def user(self,b,i): await i.response.send_message("Выберите пользователя:",view=MemberActionView(i.author.id,"database_user"),ephemeral=True)
-    @disnake.ui.button(label="🔎 Поиск",style=disnake.ButtonStyle.secondary)
-    async def search(self,b,i): await i.response.send_modal(DatabaseSearchModal())
-    @disnake.ui.button(label="💰 Финоперация",style=disnake.ButtonStyle.secondary)
-    async def fin(self,b,i): await i.response.send_modal(FinanceOperationModal())
+
+    @disnake.ui.button(label="🧹 Исправить безопасные", style=disnake.ButtonStyle.success)
+    async def repair(self, button, inter):
+        await inter.response.defer(ephemeral=True)
+        fixes = await repair_safe_domain_anomalies(inter.author.id)
+        issues = (await get_domain_anomalies(20)) + (await get_blacklist_anomalies(20))
+        em = disnake.Embed(
+            title="🧹 БЕЗОПАСНОЕ ИСПРАВЛЕНИЕ",
+            color=disnake.Color.green() if not issues else disnake.Color.orange(),
+        )
+        em.description = (
+            ("Исправлено:\n" + "\n".join(f"✅ {x}" for x in fixes))
+            if fixes else "Безопасных автоисправлений не найдено."
+        )
+        if issues:
+            em.add_field(
+                name="Остались аномалии",
+                value="\n".join(f"• {x}" for x in issues[:8])[:1000],
+                inline=False,
+            )
+        else:
+            em.add_field(name="Результат", value="✅ Аномалий инвайтов/целей/ЧС больше нет.", inline=False)
+        await inter.edit_original_response(embed=em, view=None)
+
+
+class AdminDatabaseMenuView(disnake.ui.View):
+    def __init__(self,user_id):
+        super().__init__(timeout=300)
+        self.user_id=user_id
+
+    async def interaction_check(self,inter):
+        if inter.author.id!=self.user_id:
+            await inter.response.send_message("❌ Это не ваше меню.",ephemeral=True)
+            return False
+        if not _is_admin(inter.author):
+            await inter.response.send_message("❌ Доступ только администратору.",ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="👤 Карточка пользователя",style=disnake.ButtonStyle.primary,row=0)
+    async def user(self,b,i):
+        await i.response.send_message("Выберите пользователя:",view=MemberActionView(i.author.id,"database_user"),ephemeral=True)
+
+    @disnake.ui.button(label="🔎 Поиск",style=disnake.ButtonStyle.secondary,row=0)
+    async def search(self,b,i):
+        await i.response.send_modal(DatabaseSearchModal())
+
+    @disnake.ui.button(label="💰 Финоперация",style=disnake.ButtonStyle.secondary,row=0)
+    async def fin(self,b,i):
+        await i.response.send_modal(FinanceOperationModal())
+
+    @disnake.ui.button(label="👥 Последние инвайты",style=disnake.ButtonStyle.primary,row=1)
+    async def invites(self,b,i):
+        rows=await database_service.list_recent_invites(15)
+        em=disnake.Embed(title="👥 ПОСЛЕДНИЕ ИНВАЙТЫ",color=disnake.Color.blue())
+        em.description="Записей нет." if not rows else "\n".join(
+            f"`#{r['id']}` • **{r['static_id'] or '—'}** • `{r['status']}` • рекрутер <@{r['invited_by']}> • target {('<@'+str(r['user_id'])+'>') if r['user_id'] else '—'}"
+            for r in rows
+        )[:3900]
+        await i.response.send_message(embed=em,ephemeral=True)
+
+    @disnake.ui.button(label="🎯 Последние цели",style=disnake.ButtonStyle.primary,row=1)
+    async def goals(self,b,i):
+        rows=await database_service.list_recent_goals(15)
+        em=disnake.Embed(title="🎯 ПОСЛЕДНИЕ ЦЕЛИ",color=disnake.Color.blue())
+        em.description="Записей нет." if not rows else "\n".join(
+            f"`#{r['id']}` • <@{r['user_id']}> • **{r['type']}** {r['current_value']}/{r['target_value']} • {r['period']} • `{r['status']}`"
+            for r in rows
+        )[:3900]
+        await i.response.send_message(embed=em,ephemeral=True)
+
+    @disnake.ui.button(label="💳 Последние финоперации",style=disnake.ButtonStyle.secondary,row=1)
+    async def finances(self,b,i):
+        rows=await database_service.list_recent_finances(15)
+        em=disnake.Embed(title="💳 ПОСЛЕДНИЕ ФИНОПЕРАЦИИ",color=disnake.Color.gold())
+        em.description="Записей нет." if not rows else "\n".join(
+            f"`#{r['id']}` • <@{r['user_id']}> • **{money(r['amount'])}** • `{r['type']}/{r['status']}` • {(r['reason'] or '—')[:80]}"
+            for r in rows
+        )[:3900]
+        await i.response.send_message(embed=em,ephemeral=True)
+
+    @disnake.ui.button(label="🩺 Диагностика",style=disnake.ButtonStyle.danger,row=2)
+    async def diagnostics(self,b,i):
+        await i.response.defer(ephemeral=True)
+        groups=[
+            ("Смены/отчёты",await get_shift_anomalies(8)),
+            ("Инвайты/цели",await get_domain_anomalies(8)),
+            ("Чёрный список",await get_blacklist_anomalies(8)),
+            ("Финансы",await get_finance_anomalies(limit=8)),
+            ("Уведомления",await get_notification_anomalies(8)),
+        ]
+        issues=[(title,rows) for title,rows in groups if rows]
+        em=disnake.Embed(title="🩺 ДИАГНОСТИКА БАЗЫ",color=disnake.Color.green() if not issues else disnake.Color.orange())
+        if not issues:
+            em.description="✅ Структурных аномалий не найдено."
+            return await i.edit_original_response(embed=em,view=DomainRepairView(i.author.id))
+        for title,rows in issues:
+            em.add_field(name=title,value="\n".join(f"• {x}" for x in rows[:5])[:1000],inline=False)
+        em.set_footer(text="Автоисправление меняет только заранее определённые безопасные legacy-аномалии.")
+        await i.edit_original_response(embed=em,view=DomainRepairView(i.author.id))
 
 
 class SeniorMenuView(disnake.ui.View):
@@ -1501,7 +1948,9 @@ class AdminMenuView(disnake.ui.View):
     @disnake.ui.button(label="🔔 Уведомления",style=disnake.ButtonStyle.primary,row=0)
     async def notifications(self,b,i):
         rows=await db.fetchall("SELECT * FROM notifications ORDER BY id DESC LIMIT 20"); em=disnake.Embed(title="🔔 УВЕДОМЛЕНИЯ",color=disnake.Color.blue()); em.description="Записей нет." if not rows else None
-        for r in rows[:15]: em.add_field(name=f"#{r['id']} | {r['type']} | {r['status']}",value=f"<@{r['user_id']}> • {format_utc_db(r['updated_at'])} • попыток: {r['attempts']}\n{(r['last_error'] or '—')[:150]}",inline=False)
+        for r in rows[:15]:
+            who=f"<@{r['user_id']}> • ID: `{r['user_id']}`" if r["user_id"] else "Система"
+            em.add_field(name=f"#{r['id']} | {r['type']} | {r['status']}",value=f"{who} • {format_utc_db(r['updated_at'])} • попыток: {r['attempts']}\n{(r['last_error'] or '—')[:150]}",inline=False)
         await i.response.send_message(embed=em,ephemeral=True)
     @disnake.ui.button(label="📝 Логи",style=disnake.ButtonStyle.secondary,row=0)
     async def logs(self,b,i):
@@ -1511,7 +1960,13 @@ class AdminMenuView(disnake.ui.View):
     @disnake.ui.button(label="📦 Бэкап",style=disnake.ButtonStyle.green,row=1)
     async def backup(self,b,i):
         cog=self.bot.get_cog("Admin"); await i.response.defer(ephemeral=True); path=None
-        try: path=await cog._make_backup(); await i.edit_original_response(content="📦 Бэкап готов:",file=disnake.File(path))
+        if cog is None or not hasattr(cog,"_make_backup"):
+            return await i.edit_original_response(content="❌ Модуль бэкапа сейчас недоступен. Проверьте 🩺 Здоровье.")
+        try:
+            path=await cog._make_backup(); await i.edit_original_response(content="📦 Бэкап готов:",file=disnake.File(path))
+        except Exception:
+            logger.exception("Не удалось создать бэкап из панели")
+            await i.edit_original_response(content="❌ Не удалось создать бэкап. Ошибка записана в лог.")
         finally:
             if path and os.path.exists(path): os.remove(path)
     @disnake.ui.button(label="🩺 Здоровье",style=disnake.ButtonStyle.secondary,row=1)
@@ -1534,6 +1989,13 @@ class AdminMenuView(disnake.ui.View):
     async def finance(self,b,i): await i.response.send_message("Административные финансы:",view=AdminFinanceMenuView(self.bot,i.author.id),ephemeral=True)
     @disnake.ui.button(label="🗄️ База",style=disnake.ButtonStyle.primary,row=2)
     async def database(self,b,i): await i.response.send_message("Администрирование базы:",view=AdminDatabaseMenuView(i.author.id),ephemeral=True)
+    @disnake.ui.button(label="🚫 Чёрный список",style=disnake.ButtonStyle.danger,row=2)
+    async def blacklist(self,b,i):
+        await i.response.send_message(
+            "Управление чёрным списком. Снятие доступно только Admin.",
+            view=BlacklistMenuView(i.author.id, True),
+            ephemeral=True,
+        )
 class MainPanelView(disnake.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -1674,7 +2136,7 @@ class Panel(commands.Cog):
 
         found = None
         try:
-            async for message in channel.history(limit=100):
+            async for message in channel.pins(limit=100):
                 if message.author.id != self.bot.user.id or not message.embeds:
                     continue
                 footer = message.embeds[0].footer.text if message.embeds[0].footer else ""
@@ -1682,7 +2144,18 @@ class Panel(commands.Cog):
                     found = message
                     break
         except Exception:
-            logger.warning("Не удалось просмотреть историю канала панели; будет создано новое сообщение", exc_info=True)
+            logger.info("Не удалось прочитать закреплённые сообщения панели", exc_info=True)
+        if found is None:
+            try:
+                async for message in channel.history(limit=200):
+                    if message.author.id != self.bot.user.id or not message.embeds:
+                        continue
+                    footer = message.embeds[0].footer.text if message.embeds[0].footer else ""
+                    if footer in LEGACY_PANEL_FOOTERS:
+                        found = message
+                        break
+            except Exception:
+                logger.warning("Не удалось просмотреть историю канала панели; будет создано новое сообщение", exc_info=True)
 
         view = MainPanelView(self.bot)
         if found:

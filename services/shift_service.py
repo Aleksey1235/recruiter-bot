@@ -52,7 +52,7 @@ async def _recalculate_shift_status(tx, shift_id: int):
     if active:
         status = "active"
     elif booked:
-        status = "booked" if (shift["slots"] or 0) <= 0 else "open"
+        status = "booked" if (start and now >= start) or (shift["slots"] or 0) <= 0 else "open"
     elif start and now < start and (shift["slots"] or 0) > 0:
         # До официального начала свободные места всё ещё можно занимать, даже если
         # кто-то успел начать/закончить ранний старт.
@@ -61,11 +61,11 @@ async def _recalculate_shift_status(tx, shift_id: int):
         status = "completed"
     elif missed:
         status = "missed"
+    elif start and now >= start:
+        status = "missed"
     elif end and now >= end:
         status = "missed"
     else:
-        # Смена уже началась, но участников нет. Оставляем open до её окончания,
-        # однако take_shift всё равно закрывает запись после scheduled_start.
         status = "open"
 
     await tx.execute("UPDATE shifts SET status=? WHERE id=?", (status, shift_id))
@@ -325,6 +325,11 @@ async def find_shift_to_start(user_id: int):
         """,
         (user_id, to_db(now), to_db(early_limit)),
     )
+    if len(rows) > 1:
+        raise UserFacingError(
+            "Обнаружено несколько смен, которые можно начать одновременно. "
+            "Это конфликт данных — обратитесь к администратору и проверьте /админ здоровье."
+        )
     if rows:
         return rows[0]
 
@@ -333,7 +338,9 @@ async def find_shift_to_start(user_id: int):
         SELECT sm.*, s.scheduled_start, s.scheduled_end
         FROM shift_members sm
         JOIN shifts s ON s.id=sm.shift_id
-        WHERE sm.user_id=? AND sm.status='booked' AND s.scheduled_end>?
+        WHERE sm.user_id=? AND sm.status='booked'
+          AND s.status NOT IN ('cancelled','completed','missed')
+          AND s.scheduled_end>?
         ORDER BY s.scheduled_start ASC
         LIMIT 1
         """,

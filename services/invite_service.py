@@ -3,8 +3,30 @@ import sqlite3
 import config
 from database.db import db, ensure_user, log
 from services.errors import UserFacingError
+from services import blacklist_service
 from utils.formatting import normalize_amount
 from utils.time_utils import local_now
+
+
+async def assert_target_not_blacklisted(discord_id: int | None, static_id: str | None, actor_id: int, action: str = "BLACKLIST_BLOCK_INVITE"):
+    """Public pre-check used by UI/services. Blocked attempts are logged."""
+    entry = await blacklist_service.get_active_match(discord_id, static_id)
+    if not entry:
+        return
+    await log(
+        actor_id,
+        action,
+        "blacklist",
+        entry["id"],
+        f"discord_id={discord_id or '—'} | static={static_id or '—'} | blacklist_id={entry['id']}",
+    )
+    raise UserFacingError(blacklist_service.blocked_message(entry))
+
+
+async def _assert_not_blacklisted_tx(discord_id: int | None, static_id: str | None, tx):
+    entry = await blacklist_service.get_active_match(discord_id, static_id, tx=tx)
+    if entry:
+        raise UserFacingError(blacklist_service.blocked_message(entry))
 
 
 async def create_invite(invited_user_id: int, invited_by: int, inviter_name: str, static_id: str, full_name: str, checklist: dict):
@@ -25,7 +47,10 @@ async def create_invite(invited_user_id: int, invited_by: int, inviter_name: str
     if set(checklist) != allowed_checklist or any(checklist[key] not in ("yes", "no") for key in allowed_checklist):
         raise UserFacingError("Чек-лист инвайта содержит некорректные данные. Заполните его заново.")
 
+    await assert_target_not_blacklisted(invited_user_id, static_id, invited_by, "BLACKLIST_BLOCK_INVITE")
+
     async with db.transaction() as tx:
+        await _assert_not_blacklisted_tx(invited_user_id, static_id, tx)
         existing = await tx.fetchone("SELECT * FROM invites WHERE static_id=?", (static_id,))
         by_user = await tx.fetchone(
             "SELECT * FROM invites WHERE user_id=? AND status IN ('pending','accepted') ORDER BY id DESC LIMIT 1",
@@ -107,10 +132,16 @@ async def approve_invite(invite_id: int, reviewer_id: int, amount=0):
     if amount > config.MAX_FINANCE_AMOUNT:
         raise UserFacingError(f"Сумма превышает допустимый максимум: {config.MAX_FINANCE_AMOUNT:,.2f}.")
 
+    preview = await db.fetchone("SELECT user_id, static_id FROM invites WHERE id=?", (invite_id,))
+    if not preview:
+        raise UserFacingError("Инвайт не найден.")
+    await assert_target_not_blacklisted(preview["user_id"], preview["static_id"], reviewer_id, "BLACKLIST_BLOCK_APPROVE")
+
     async with db.transaction() as tx:
         invite = await tx.fetchone("SELECT * FROM invites WHERE id=?", (invite_id,))
         if not invite:
             raise UserFacingError("Инвайт не найден.")
+        await _assert_not_blacklisted_tx(invite["user_id"], invite["static_id"], tx)
         cursor = await tx.execute(
             """
             UPDATE invites

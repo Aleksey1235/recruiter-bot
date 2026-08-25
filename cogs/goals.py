@@ -38,10 +38,11 @@ class Goals(commands.Cog):
         except UserFacingError as exc:
             return await inter.edit_original_response(content=f"❌ {exc}")
 
+        current = await goal_service.calculate_progress(пользователь.id, тип, период)
         dm = disnake.Embed(title="🎯 ВАМ ПОСТАВЛЕНА НОВАЯ ЦЕЛЬ", color=disnake.Color.blue())
         dm.add_field(name="Цель", value=f"{TYPE_LABELS[тип]}: {значение}", inline=True)
         dm.add_field(name="Период", value=период, inline=True)
-        dm.add_field(name="Прогресс", value=f"0 / {значение}", inline=True)
+        dm.add_field(name="Прогресс", value=f"{current} / {значение}", inline=True)
         await notify(self.bot, пользователь.id, "GOAL_SET", "goal", goal_id, embed=dm)
         await inter.edit_original_response(content=f"🎯 Цель для {пользователь.mention}: {TYPE_LABELS[тип]} — {значение}.")
 

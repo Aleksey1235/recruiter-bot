@@ -5,6 +5,7 @@ import config
 from database.db import db, ensure_user, log
 from services.errors import UserFacingError
 from services.finance_service import get_balance
+from utils.ids import maybe_positive_sqlite_int
 from utils.time_utils import local_now
 
 
@@ -57,6 +58,15 @@ async def get_user_overview(user_id: int) -> dict | None:
         "SELECT COUNT(*) AS active FROM goals WHERE user_id=? AND status='active'",
         (user_id,),
     )
+    blacklist = await db.fetchone(
+        """
+        SELECT * FROM blacklist
+        WHERE status='active' AND (discord_id=? OR (static_id IS NOT NULL AND static_id=?))
+        ORDER BY CASE WHEN discord_id=? THEN 0 ELSE 1 END, id DESC
+        LIMIT 1
+        """,
+        (user_id, user["static_id"], user_id),
+    )
     accrued, paid, available = await get_balance(user_id)
     return {
         "user": dict(user),
@@ -64,6 +74,7 @@ async def get_user_overview(user_id: int) -> dict | None:
         "reports": dict(reports),
         "invites": dict(invites),
         "active_goals": int(goals["active"] or 0),
+        "blacklist": dict(blacklist) if blacklist else None,
         "accrued": accrued,
         "paid": paid,
         "available": available,
@@ -77,15 +88,22 @@ async def search_users(query: str, limit: int = 10):
     limit = max(1, min(int(limit), 20))
 
     if query.isdigit():
-        exact = await db.fetchall(
-            """
-            SELECT * FROM users
-            WHERE discord_id=? OR static_id=?
-            ORDER BY CASE WHEN discord_id=? THEN 0 ELSE 1 END, discord_id
-            LIMIT ?
-            """,
-            (int(query), query, int(query), limit),
-        )
+        discord_id = maybe_positive_sqlite_int(query)
+        if discord_id is not None:
+            exact = await db.fetchall(
+                """
+                SELECT * FROM users
+                WHERE discord_id=? OR static_id=?
+                ORDER BY CASE WHEN discord_id=? THEN 0 ELSE 1 END, discord_id
+                LIMIT ?
+                """,
+                (discord_id, query, discord_id, limit),
+            )
+        else:
+            exact = await db.fetchall(
+                "SELECT * FROM users WHERE static_id=? ORDER BY discord_id LIMIT ?",
+                (query, limit),
+            )
         if exact:
             return exact
 
@@ -244,3 +262,32 @@ async def add_user_note(user_id: int, username: str | None, text: str, actor_id:
         await tx.execute("UPDATE users SET notes=? WHERE discord_id=?", (notes, user_id))
         await log(actor_id, "DB_NOTE_ADD", "user", user_id, text, tx=tx)
     return notes
+
+
+async def list_recent_invites(limit: int = 15):
+    return await db.fetchall(
+        "SELECT * FROM invites ORDER BY id DESC LIMIT ?",
+        (max(1, min(int(limit), 25)),),
+    )
+
+
+async def list_recent_goals(limit: int = 15):
+    return await db.fetchall(
+        "SELECT * FROM goals ORDER BY id DESC LIMIT ?",
+        (max(1, min(int(limit), 25)),),
+    )
+
+
+async def list_recent_finances(limit: int = 15):
+    return await db.fetchall(
+        "SELECT * FROM finances ORDER BY id DESC LIMIT ?",
+        (max(1, min(int(limit), 25)),),
+    )
+
+
+async def get_invite(invite_id: int):
+    return await db.fetchone("SELECT * FROM invites WHERE id=?", (invite_id,))
+
+
+async def get_goal(goal_id: int):
+    return await db.fetchone("SELECT * FROM goals WHERE id=?", (goal_id,))
