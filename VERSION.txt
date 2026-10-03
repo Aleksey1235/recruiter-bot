@@ -1,10 +1,11 @@
-Recruiter Bot v6 — DeSanta / ECLIPSE
+Recruiter Bot v6.1 — DeSanta / ECLIPSE
 Build date: 2026-10-03
-Base build: 2026-08-25 Production Ultimate
-Database schema: v6
+Base release: v6; GitHub main 9efa522ebcf8b13a12348eb0cdad6e73572fc097
+Database schema: v6 (unchanged)
 Python target: 3.11
-Primary UI: buttons; FileUpload modal for advertising evidence
-Advertising defaults: 20% proof, 3-minute interval, 90-day reviewed-photo retention
-Advertising integration: all-time profile, weekly report, day/week/month goals
-Tests: 108 passed, Python 3.11.17, real disnake 2.12.1 / aiosqlite 0.22.1
-Live Discord / production host: not accessed
+Fix: private component responses; recovery of overwritten shared cards
+Runtime changes: cogs/advertising.py, cogs/panel.py, cogs/shifts.py
+Role access checks: recruiter / senior / admin; old views and modal submissions
+Tests: 236 passed, Python 3.11.17, real disnake 2.12.1 / aiosqlite 0.22.1
+Offline startup: all 13 cogs loaded
+Live Discord / production host: hotfix not deployed by Codex

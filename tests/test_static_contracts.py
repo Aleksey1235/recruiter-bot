@@ -151,7 +151,7 @@ def test_review_flows_defer_and_surface_delivery_sync_warnings():
     panel = (ROOT / "cogs" / "panel.py").read_text("utf-8")
     for source in (shifts, invites, panel):
         assert "Данные в БД сохранены" in source
-    assert "await inter.response.defer(ephemeral=True)" in shifts
+    assert "await inter.response.defer(ephemeral=True, with_message=True)" in shifts
     assert "await inter.response.defer(ephemeral=True)" in invites
 
 

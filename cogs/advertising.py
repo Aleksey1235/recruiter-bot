@@ -58,7 +58,7 @@ def menu_view(member):
 async def show_advertising_menu(inter):
     if not inter.guild or inter.guild.id != config.GUILD_ID or not is_recruiter_or_higher(inter.author):
         return await inter.response.send_message("❌ Раздел доступен рекрутерам и старшему составу.", ephemeral=True)
-    await inter.response.defer(ephemeral=True)
+    await inter.response.defer(ephemeral=True, with_message=True)
     await ensure_user(inter.author.id, username=inter.author.name)
     await inter.edit_original_response(embed=menu_embed(), view=menu_view(inter.author))
 
@@ -271,7 +271,7 @@ class Advertising(commands.Cog):
                         raise UserFacingError("Откройте текущую попытку: загрузка фото сейчас недоступна.")
                     return await open_modal(inter, upload_modal(attempt_id, inter.author.id))
                 return await open_modal(inter, reason_modal(action, attempt_id, inter.author.id))
-            await inter.response.defer(ephemeral=True)
+            await inter.response.defer(ephemeral=True, with_message=True)
             if action == "prepare":
                 self.channel(inter.guild)
                 row = await ads.prepare(inter.author.id, inter.author.name, inter.author.display_name)
@@ -375,7 +375,7 @@ class Advertising(commands.Cog):
             return
         if not await self._allowed(inter, senior=cid != "ads:history_select"):
             return
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             target_id = int(inter.values[0])
             if cid == "ads:history_select":
@@ -410,7 +410,7 @@ class Advertising(commands.Cog):
             return
         if not await self._allowed(inter, senior=action == "reject"):
             return
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             if inter.author.id != owner_id:
                 raise UserFacingError("Это не ваша форма.")

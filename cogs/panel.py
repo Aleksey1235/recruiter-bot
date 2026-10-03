@@ -320,7 +320,7 @@ class CreateShiftModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         if not is_senior_or_admin(inter.author):
             return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             start = datetime.strptime(f"{inter.text_values['date']} {inter.text_values['start']}", "%d.%m.%Y %H:%M")
             end = datetime.strptime(f"{inter.text_values['date']} {inter.text_values['end']}", "%d.%m.%Y %H:%M")
@@ -581,7 +581,7 @@ class InviteChecklistView(disnake.ui.View):
             "fraction": "yes" if "fraction" in done else "no",
             "info": "yes" if "info" in done else "no",
         }
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             invite_id = await invite_service.create_invite(
                 self.target.id,
@@ -996,7 +996,7 @@ class ApproveReportByIdModal(disnake.ui.Modal):
             report_id = int(inter.text_values["id"].strip())
         except ValueError:
             return await inter.response.send_message("❌ ID отчёта должен быть числом.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             report = await shift_service.approve_report(report_id, inter.author.id)
         except UserFacingError as exc:
@@ -1028,7 +1028,7 @@ class RejectReportByIdModal(disnake.ui.Modal):
         except ValueError:
             return await inter.response.send_message("❌ ID отчёта должен быть числом.", ephemeral=True)
         reason=inter.text_values["reason"]
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             report = await shift_service.reject_report(report_id, inter.author.id, reason)
         except UserFacingError as exc:
@@ -1135,7 +1135,7 @@ class InviteApproveByIdModal(disnake.ui.Modal):
             amount=normalize_amount(inter.text_values["amount"])
         except ValueError as exc:
             return await inter.response.send_message(f"❌ {exc}", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             invite,_=await invite_service.approve_invite(invite_id, inter.author.id, amount)
         except UserFacingError as exc:
@@ -1167,7 +1167,7 @@ class InviteRejectByIdModal(disnake.ui.Modal):
         except ValueError:
             return await inter.response.send_message("❌ ID инвайта должен быть числом.", ephemeral=True)
         reason=inter.text_values["reason"]
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             invite=await invite_service.reject_invite(invite_id, inter.author.id, reason)
         except UserFacingError as exc:
@@ -1580,7 +1580,7 @@ class BlacklistAddModal(disnake.ui.Modal):
             return await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
         if getattr(self.user, "bot", False):
             return await inter.response.send_message("❌ Нельзя добавить бота в ЧС.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             row = await blacklist_service.add_entry(
                 self.user.id,
@@ -1641,7 +1641,7 @@ class BlacklistManualAddModal(disnake.ui.Modal):
     async def callback(self, inter):
         if not _is_admin(inter.author):
             return await inter.response.send_message("❌ Чёрный список доступен только Admin.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             discord_id = int(inter.text_values["discord_id"].strip())
         except ValueError:
@@ -1674,7 +1674,7 @@ class BlacklistDetailsModal(disnake.ui.Modal):
             return await inter.response.send_message("❌ Чёрный список доступен только Admin.",ephemeral=True)
         try: entry_id=int(inter.text_values["id"].strip())
         except ValueError: return await inter.response.send_message("❌ ID записи должен быть числом.",ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             row=await blacklist_service.update_entry_details(entry_id,inter.author.id,inter.text_values.get("evidence"),inter.text_values.get("note"))
         except UserFacingError as exc:
@@ -1718,7 +1718,7 @@ class BlacklistRemoveModal(disnake.ui.Modal):
             entry_id = int(inter.text_values["id"])
         except ValueError:
             return await inter.response.send_message("❌ ID записи должен быть числом.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             row = await blacklist_service.remove_entry(entry_id, inter.author.id, inter.text_values["reason"])
         except UserFacingError as exc:
@@ -1812,7 +1812,7 @@ class DomainRepairView(disnake.ui.View):
 
     @disnake.ui.button(label="🧹 Исправить безопасные", style=disnake.ButtonStyle.success)
     async def repair(self, button, inter):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         fixes = await repair_safe_domain_anomalies(inter.author.id)
         issues = (await get_domain_anomalies(20)) + (await get_blacklist_anomalies(20))
         em = disnake.Embed(
@@ -1892,7 +1892,7 @@ class AdminDatabaseMenuView(disnake.ui.View):
 
     @disnake.ui.button(label="🩺 Диагностика",style=disnake.ButtonStyle.danger,row=2)
     async def diagnostics(self,b,i):
-        await i.response.defer(ephemeral=True)
+        await i.response.defer(ephemeral=True, with_message=True)
         groups=[
             ("Смены/отчёты",await get_shift_anomalies(8)),
             ("Инвайты/цели",await get_domain_anomalies(8)),
@@ -1964,7 +1964,7 @@ class AdminMenuView(disnake.ui.View):
         await i.response.send_message(embed=em,ephemeral=True)
     @disnake.ui.button(label="📦 Бэкап",style=disnake.ButtonStyle.green,row=1)
     async def backup(self,b,i):
-        cog=self.bot.get_cog("Admin"); await i.response.defer(ephemeral=True); path=None
+        cog=self.bot.get_cog("Admin"); await i.response.defer(ephemeral=True, with_message=True); path=None
         if cog is None or not hasattr(cog,"_make_backup"):
             return await i.edit_original_response(content="❌ Модуль бэкапа сейчас недоступен. Проверьте 🩺 Здоровье.")
         try:
@@ -1976,7 +1976,7 @@ class AdminMenuView(disnake.ui.View):
             if path and os.path.exists(path): os.remove(path)
     @disnake.ui.button(label="🩺 Здоровье",style=disnake.ButtonStyle.secondary,row=1)
     async def health(self,b,i):
-        await i.response.defer(ephemeral=True)
+        await i.response.defer(ephemeral=True, with_message=True)
         checks = await run_health_checks(self.bot, i.guild)
         ok_all = all(check.ok for check in checks)
         em = disnake.Embed(
@@ -2110,6 +2110,24 @@ class MainPanelView(disnake.ui.View):
         await show_advertising_menu(inter)
 
 
+def _is_panel_message(message, bot_id):
+    if message.author.id != bot_id:
+        return False
+    footer = message.embeds[0].footer.text if message.embeds and message.embeds[0].footer else ""
+    if footer in LEGACY_PANEL_FOOTERS:
+        return True
+    # v6 could replace the shared panel with an advertising submenu. These
+    # components cannot otherwise be public in the configured panel channel.
+    ids = [
+        getattr(component, "custom_id", "") or ""
+        for row in getattr(message, "components", [])
+        for component in row.children
+    ]
+    if any(cid.startswith(("ads:approve:", "ads:reject:")) for cid in ids):
+        return False
+    return any(cid.startswith("ads:") for cid in ids)
+
+
 class Panel(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -2160,10 +2178,7 @@ class Panel(commands.Cog):
         found = None
         try:
             async for message in channel.pins(limit=100):
-                if message.author.id != self.bot.user.id or not message.embeds:
-                    continue
-                footer = message.embeds[0].footer.text if message.embeds[0].footer else ""
-                if footer in LEGACY_PANEL_FOOTERS:
+                if _is_panel_message(message, self.bot.user.id):
                     found = message
                     break
         except Exception:
@@ -2171,10 +2186,7 @@ class Panel(commands.Cog):
         if found is None:
             try:
                 async for message in channel.history(limit=200):
-                    if message.author.id != self.bot.user.id or not message.embeds:
-                        continue
-                    footer = message.embeds[0].footer.text if message.embeds[0].footer else ""
-                    if footer in LEGACY_PANEL_FOOTERS:
+                    if _is_panel_message(message, self.bot.user.id):
                         found = message
                         break
             except Exception:
@@ -2182,7 +2194,7 @@ class Panel(commands.Cog):
 
         view = MainPanelView(self.bot)
         if found:
-            await found.edit(embed=_panel_embed(), view=view)
+            await found.edit(content=None, embed=_panel_embed(), view=view)
             await self._disable_old_panel_in_shifts_channel(guild)
             logger.info("Панель управления обновлена: message_id=%s", found.id)
             return
