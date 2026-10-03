@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ import aiosqlite
 import config
 
 logger = logging.getLogger(__name__)
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -114,7 +116,7 @@ CREATE TABLE IF NOT EXISTS goals (
     status TEXT NOT NULL DEFAULT 'active',
     created_by INTEGER,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK (type IN ('люди', 'смены', 'часы')),
+    CHECK (type IN ('люди', 'смены', 'часы', 'рекламы')),
     CHECK (period IN ('день', 'неделя', 'месяц')),
     CHECK (status IN ('active', 'deleted')),
     CHECK (target_value >= 0),
@@ -182,6 +184,41 @@ CREATE TABLE IF NOT EXISTS blacklist (
     CHECK (status IN ('active', 'removed'))
 );
 
+CREATE TABLE IF NOT EXISTS ad_state (
+    user_id INTEGER PRIMARY KEY,
+    proof_required INTEGER NOT NULL DEFAULT 0 CHECK (proof_required IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS ad_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    discord_name TEXT NOT NULL,
+    family_name TEXT NOT NULL,
+    shift_id INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+    member_id INTEGER REFERENCES shift_members(id) ON DELETE SET NULL,
+    requires_proof INTEGER NOT NULL CHECK (requires_proof IN (0,1)),
+    status TEXT NOT NULL DEFAULT 'prepared'
+        CHECK (status IN ('prepared','uploading','pending','counted','approved','rejected','cancelled')),
+    prepared_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMP,
+    reviewed_by INTEGER,
+    reviewed_at TIMESTAMP,
+    reject_reason TEXT,
+    cancel_reason TEXT,
+    proof_sha256 TEXT,
+    proof_channel_id INTEGER,
+    proof_message_id INTEGER,
+    proof_attachment_id INTEGER,
+    proof_filename TEXT,
+    proof_deleted_at TIMESTAMP,
+    card_status TEXT,
+    report_synced_status TEXT,
+    upload_token TEXT,
+    uploading_at TIMESTAMP,
+    CHECK (status NOT IN ('pending','approved','rejected','uploading') OR requires_proof=1),
+    CHECK (status<>'counted' OR requires_proof=0)
+);
+
 """
 
 INDEX_SQL = """
@@ -215,6 +252,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_blacklist_active_discord
     ON blacklist(discord_id) WHERE status='active';
 CREATE UNIQUE INDEX IF NOT EXISTS ux_blacklist_active_static
     ON blacklist(static_id) WHERE status='active' AND static_id IS NOT NULL AND TRIM(static_id)<>'';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ad_one_open_attempt
+    ON ad_attempts(user_id) WHERE status IN ('prepared','uploading');
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ad_unique_proof
+    ON ad_attempts(proof_sha256) WHERE proof_sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ads_user_published ON ad_attempts(user_id, published_at);
+CREATE INDEX IF NOT EXISTS idx_ads_status_reviewed ON ad_attempts(status, reviewed_at);
 """
 
 
@@ -278,13 +321,23 @@ class Database:
         await self.db.execute("PRAGMA journal_mode = WAL")
         await self.db.execute("PRAGMA synchronous = NORMAL")
         await self.db.execute("PRAGMA busy_timeout = 10000")
-        await self._backup_before_migration_if_needed()
-        await self.db.executescript(SCHEMA_SQL)
-        await self._migrate_additive_columns()
-        await self._repair_notification_null_users()
-        await self.db.executescript(INDEX_SQL)
-        await self.db.execute("PRAGMA user_version = 4")
-        await self.db.commit()
+        try:
+            version = await self.db.execute("PRAGMA user_version")
+            row = await version.fetchone()
+            if row and row[0] > SCHEMA_VERSION:
+                raise RuntimeError("БД создана более новой версией бота; запуск старого кода запрещён")
+            await self._backup_before_migration_if_needed()
+            await self.db.executescript(SCHEMA_SQL)
+            await self._migrate_additive_columns()
+            await self._migrate_advertising_goal_type()
+            await self._repair_notification_null_users()
+            await self.db.executescript(INDEX_SQL)
+            await self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            await self.db.commit()
+        except BaseException:
+            await self.db.close()
+            self.db = None
+            raise
 
     async def _backup_before_migration_if_needed(self):
         if not config.AUTO_MIGRATION_BACKUP or config.DATABASE_PATH == ":memory:":
@@ -293,7 +346,7 @@ class Database:
         version_cursor = await self.db.execute("PRAGMA user_version")
         version_row = await version_cursor.fetchone()
         version = int(version_row[0] if version_row else 0)
-        if version >= 4:
+        if version >= SCHEMA_VERSION:
             return
 
         tables_cursor = await self.db.execute(
@@ -303,8 +356,8 @@ class Database:
         if not tables_row or int(tables_row[0] or 0) == 0:
             return
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{config.DATABASE_PATH}.pre_v4_{stamp}.db"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = f"{config.DATABASE_PATH}.pre_v{SCHEMA_VERSION}_{stamp}.db"
         target = sqlite3.connect(backup_path)
         try:
             await self.db.backup(target)
@@ -469,6 +522,50 @@ class Database:
                 """
             )
 
+
+    async def _migrate_advertising_goal_type(self):
+        """Расширяет старый CHECK, сохраняя строки, индексы, триггеры и sequence."""
+        cursor = await self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='goals'")
+        row = await cursor.fetchone()
+        original = row["sql"]
+        pattern = r"CHECK\s*\(\s*type\s+IN\s*\(\s*'люди'\s*,\s*'смены'\s*,\s*'часы'\s*\)\s*\)"
+        expanded, changed = re.subn(
+            pattern, "CHECK (type IN ('люди', 'смены', 'часы', 'рекламы'))", original, flags=re.IGNORECASE,
+        )
+        if not changed:
+            # Чистая v6 и старые таблицы без ограничивающего CHECK не требуют перестройки.
+            return
+        create_sql, renamed = re.subn(
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:goals|"goals"|`goals`|\[goals\])(?=\s*\()',
+            'CREATE TABLE "goals_v6_migration"', expanded, count=1, flags=re.IGNORECASE,
+        )
+        if renamed != 1:
+            raise RuntimeError("Не удалось подготовить безопасную миграцию таблицы goals")
+        cursor = await self.db.execute("PRAGMA table_info(goals)")
+        columns = [column["name"] for column in await cursor.fetchall()]
+        quoted_columns = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+        cursor = await self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name='goals' AND type IN ('index','trigger') AND sql IS NOT NULL"
+        )
+        objects = [item["sql"] for item in await cursor.fetchall()]
+        cursor = await self.db.execute("SELECT seq FROM sqlite_sequence WHERE name='goals'")
+        sequence = await cursor.fetchone()
+        await self.db.execute("SAVEPOINT advertising_goal_migration")
+        try:
+            await self.db.execute(create_sql)
+            await self.db.execute(f"INSERT INTO goals_v6_migration ({quoted_columns}) SELECT {quoted_columns} FROM goals")
+            await self.db.execute("DROP TABLE goals")
+            await self.db.execute("ALTER TABLE goals_v6_migration RENAME TO goals")
+            for sql in objects:
+                await self.db.execute(sql)
+            if sequence is not None:
+                await self.db.execute("DELETE FROM sqlite_sequence WHERE name='goals'")
+                await self.db.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('goals',?)", (sequence["seq"],))
+            await self.db.execute("RELEASE SAVEPOINT advertising_goal_migration")
+        except BaseException:
+            await self.db.execute("ROLLBACK TO SAVEPOINT advertising_goal_migration")
+            await self.db.execute("RELEASE SAVEPOINT advertising_goal_migration")
+            raise
 
     async def _repair_notification_null_users(self):
         columns = await self.get_columns("notifications")

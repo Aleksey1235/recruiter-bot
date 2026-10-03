@@ -1,8 +1,9 @@
 from database.db import db, ensure_user, log
 from services.errors import UserFacingError
+from services import advertising_service
 from utils.time_utils import period_start, to_db
 
-VALID_GOAL_TYPES = {"люди", "смены", "часы"}
+VALID_GOAL_TYPES = {"люди", "смены", "часы", "рекламы"}
 VALID_GOAL_PERIODS = {"день", "неделя", "месяц"}
 MAX_GOAL_VALUE = 1_000_000
 
@@ -61,6 +62,8 @@ async def delete_active_goals(user_id: int, actor_id: int):
 
 
 async def calculate_progress(user_id: int, goal_type: str, period: str) -> int:
+    if goal_type == "рекламы":
+        return (await advertising_service.summary(user_id, period))["total"]
     start = period_start(period)
     date_clause = ""
     params = [user_id]

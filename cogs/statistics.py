@@ -70,6 +70,8 @@ class Statistics(commands.Cog):
             inline=True,
         )
         embed.add_field(name="⭐ РЕЙТИНГ", value=f"Место: #{data['rank']}" if data["rank"] else "Нет места", inline=True)
+        from cogs.advertising import add_summary_field
+        await add_summary_field(embed, user_id, period=period)
         return embed
 
     @stats.sub_command(name="моя", description="Моя статистика")

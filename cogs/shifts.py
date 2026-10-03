@@ -109,41 +109,6 @@ async def _notify_report_rejected(bot, report, reason: str):
     return await notify(bot, report["user_id"], "REPORT_REJECTED", "shift_report", report["id"], embed=dm)
 
 
-class TakeShiftModal(disnake.ui.Modal):
-    def __init__(self, shift_id: int):
-        self.shift_id = shift_id
-        super().__init__(
-            title="Взятие смены",
-            custom_id=f"shift_take_modal:{shift_id}",
-            components=[
-                disnake.ui.TextInput(
-                    label="Ваш статик",
-                    custom_id="static_id",
-                    placeholder="Например: 12345",
-                    required=True,
-                    max_length=config.MAX_STATIC_ID_LENGTH,
-                )
-            ],
-        )
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        if not is_recruiter_or_higher(inter.author):
-            return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
-        try:
-            await shift_service.take_shift(
-                self.shift_id,
-                inter.author.id,
-                inter.author.name,
-                inter.text_values["static_id"],
-            )
-        except UserFacingError as exc:
-            return await inter.edit_original_response(content=f"❌ {exc}")
-
-        await inter.edit_original_response(content=f"✅ Вы записались на смену **#{self.shift_id}**.")
-        await update_shift_message(inter.guild, self.shift_id)
-
-
 class LeaveShiftModal(disnake.ui.Modal):
     def __init__(self, shift_id: int):
         self.shift_id = shift_id
@@ -222,6 +187,8 @@ class FinishShiftModal(disnake.ui.Modal):
         if channel:
             try:
                 embed = EmbedGenerator.create_report_embed(result.report, result.member, inter.author.mention)
+                from cogs.advertising import add_summary_field
+                await add_summary_field(embed, inter.author.id, shift_id=result.report["shift_id"])
                 message = await channel.send(
                     content=f"<@&{config.SENIOR_ROLE_ID}> <@&{config.ADMIN_ROLE_ID}>",
                     embed=embed,
@@ -300,6 +267,8 @@ class ResubmitReportModal(disnake.ui.Modal):
         if channel:
             try:
                 embed = EmbedGenerator.create_report_embed(result.report, result.member, inter.author.mention)
+                from cogs.advertising import add_summary_field
+                await add_summary_field(embed, inter.author.id, shift_id=result.report["shift_id"])
                 embed.title = "♻️ ИСПРАВЛЕННЫЙ ОТЧЁТ ПО СМЕНЕ"
                 message = await channel.send(
                     content=f"<@&{config.SENIOR_ROLE_ID}> <@&{config.ADMIN_ROLE_ID}>",
@@ -473,6 +442,10 @@ async def sync_report_review_message(guild, report_id: int, approved: bool, revi
         embed.add_field(name="👤 Проверил", value=reviewer_mention, inline=True)
         if reason:
             embed.add_field(name="📝 Причина", value=reason, inline=False)
+        from cogs.advertising import add_summary_field
+        details = await db.fetchone("SELECT shift_id,user_id FROM shift_reports WHERE id=?", (report_id,))
+        if details:
+            await add_summary_field(embed, details["user_id"], shift_id=details["shift_id"])
         embed.set_footer(text=f"Отчёт #{report_id}")
         await message.edit(embed=embed, view=None)
         return True
@@ -500,7 +473,20 @@ class Shifts(commands.Cog):
                     shift_id = int(custom_id.rsplit(":", 1)[1])
             except (ValueError, IndexError, AttributeError):
                 return await inter.response.send_message("❌ Не удалось определить ID смены.", ephemeral=True)
-            return await inter.response.send_modal(TakeShiftModal(shift_id))
+            await inter.response.defer(ephemeral=True)
+            try:
+                await shift_service.take_shift(shift_id, inter.author.id, inter.author.name)
+            except UserFacingError as exc:
+                return await inter.edit_original_response(content=f"❌ {exc}")
+            await inter.edit_original_response(content=f"✅ Вы записались на смену **#{shift_id}**.")
+            try:
+                await update_shift_message(inter.guild, shift_id)
+            except Exception:
+                logger.exception("Не удалось обновить карточку смены #%s после записи", shift_id)
+                await inter.edit_original_response(
+                    content=f"✅ Вы записались на смену **#{shift_id}**. ⚠️ Карточка не обновилась; запись в БД сохранена."
+                )
+            return
 
         if custom_id.startswith("shift:leave:"):
             if not is_recruiter_or_higher(inter.author):

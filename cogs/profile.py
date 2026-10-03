@@ -49,6 +49,8 @@ class Profile(commands.Cog):
         embed.add_field(name="👥 Инвайтов", value=str(invites["count"] or 0), inline=True)
         embed.add_field(name="💰 Начислено", value=money(accrued), inline=True)
         embed.add_field(name="📊 К выплате", value=money(available), inline=True)
+        from cogs.advertising import add_summary_field
+        await add_summary_field(embed, target.id, "всё время")
 
         # Заметки — внутренний инструмент старшего состава, обычным рекрутерам их не показываем.
         if user["notes"] and is_senior_or_admin(inter.author):

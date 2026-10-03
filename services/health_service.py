@@ -66,7 +66,7 @@ async def get_domain_anomalies(limit: int = 20) -> list[str]:
     )
     for row in goal_rows:
         reasons = []
-        if row["type"] not in ("люди", "смены", "часы"):
+        if row["type"] not in ("люди", "смены", "часы", "рекламы"):
             reasons.append(f"тип={row['type']!r}")
         if row["period"] not in ("день", "неделя", "месяц"):
             reasons.append(f"период={row['period']!r}")
@@ -349,7 +349,8 @@ async def run_health_checks(bot, guild=None) -> list[HealthCheck]:
 
         version = await db.fetchone("PRAGMA user_version")
         version_value = int(version[0] if version else 0)
-        checks.append(HealthCheck("Схема БД", version_value >= 4, f"версия: {version_value}"))
+        from database.db import SCHEMA_VERSION
+        checks.append(HealthCheck("Схема БД", version_value == SCHEMA_VERSION, f"версия: {version_value}"))
 
         bad_shifts = await db.fetchone(
             """
@@ -457,7 +458,7 @@ async def run_health_checks(bot, guild=None) -> list[HealthCheck]:
         bad_goals = await db.fetchone(
             """
             SELECT COUNT(*) AS count FROM goals
-            WHERE type IS NULL OR type NOT IN ('люди','смены','часы')
+            WHERE type IS NULL OR type NOT IN ('люди','смены','часы','рекламы')
                OR period IS NULL OR period NOT IN ('день','неделя','месяц')
                OR status IS NULL OR status NOT IN ('active','deleted')
                OR target_value IS NULL OR current_value IS NULL
@@ -623,4 +624,23 @@ async def run_health_checks(bot, guild=None) -> list[HealthCheck]:
         if not backup_loop or not backup_loop.is_running():
             task_errors.append("автобэкап")
     checks.append(HealthCheck("Фоновые задачи", not task_errors, f"не работают: {', '.join(task_errors)}" if task_errors else ""))
+    from services import advertising_service
+    try:
+        ad_errors = await advertising_service.anomalies()
+        checks.append(HealthCheck("Учёт рекламы", not ad_errors, "; ".join(ad_errors)))
+        ads_cog = bot.get_cog("Advertising")
+        if config.ADS_REVIEW_CHANNEL_ID:
+            ad_runtime_errors = []
+            if not ads_cog or not ads_cog.maintenance.is_running():
+                ad_runtime_errors.append("фоновая задача не работает")
+            if guild is not None and ads_cog:
+                try:
+                    ads_cog.channel(guild)
+                except Exception as exc:
+                    ad_runtime_errors.append(str(exc))
+            checks.append(HealthCheck("Канал и задача рекламы", not ad_runtime_errors, "; ".join(ad_runtime_errors)))
+        else:
+            checks.append(HealthCheck("Канал рекламы", True, "не настроен; учёт рекламы выключен, основные функции доступны"))
+    except Exception as exc:
+        checks.append(HealthCheck("Реклама", False, type(exc).__name__))
     return checks
