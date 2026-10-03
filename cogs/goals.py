@@ -6,7 +6,7 @@ from services import goal_service
 from services.errors import UserFacingError
 from utils.checks import is_recruiter, is_senior, is_recruiter_or_higher
 
-TYPE_LABELS = {"люди": "👥 Люди", "смены": "📋 Смены", "часы": "⏱ Часы"}
+TYPE_LABELS = {"люди": "👥 Люди", "смены": "📋 Смены", "часы": "⏱ Часы", "рекламы": "📢 Рекламы"}
 PERIOD_LABELS = {"день": "за сегодня", "неделя": "за неделю", "месяц": "за месяц"}
 
 
@@ -24,7 +24,7 @@ class Goals(commands.Cog):
         self,
         inter,
         пользователь: disnake.Member,
-        тип: str = commands.Param(choices=["люди", "смены", "часы"]),
+        тип: str = commands.Param(choices=["люди", "смены", "часы", "рекламы"]),
         значение: int = 0,
         период: str = commands.Param(choices=["день", "неделя", "месяц"], default="неделя"),
     ):

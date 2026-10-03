@@ -64,6 +64,14 @@ MAX_NOTIFICATION_ATTEMPTS = _int_env("MAX_NOTIFICATION_ATTEMPTS", 3)
 MAX_FINANCE_AMOUNT = _int_env("MAX_FINANCE_AMOUNT", 1_000_000_000)
 NOTIFICATION_PENDING_TIMEOUT_MINUTES = _int_env("NOTIFICATION_PENDING_TIMEOUT_MINUTES", 10)
 
+# Реклама включается после указания отдельного закрытого канала проверки.
+ADS_REVIEW_CHANNEL_ID = _int_env("ADS_REVIEW_CHANNEL_ID")
+ADS_FAMILY_NAME = os.getenv("ADS_FAMILY_NAME", "DeSanta").strip() or "DeSanta"
+ADS_CHECK_PERCENT = _int_env("ADS_CHECK_PERCENT", 20)
+ADS_INTERVAL_MINUTES = _int_env("ADS_INTERVAL_MINUTES", 3)
+ADS_RETENTION_DAYS = _int_env("ADS_RETENTION_DAYS", 90)
+ADS_MAX_FILE_BYTES = 8 * 1024 * 1024
+
 
 def validate_config() -> None:
     missing = []
@@ -108,6 +116,16 @@ def validate_config() -> None:
         raise ConfigError("MAX_NOTIFICATION_ATTEMPTS должен быть >= 1")
     if MAX_FINANCE_AMOUNT <= 0:
         raise ConfigError("MAX_FINANCE_AMOUNT должен быть > 0")
+    if ADS_REVIEW_CHANNEL_ID < 0:
+        raise ConfigError("ADS_REVIEW_CHANNEL_ID не может быть отрицательным")
+    if not 0 <= ADS_CHECK_PERCENT <= 100:
+        raise ConfigError("ADS_CHECK_PERCENT должен быть от 0 до 100")
+    if ADS_INTERVAL_MINUTES < 0:
+        raise ConfigError("ADS_INTERVAL_MINUTES не может быть отрицательным")
+    if ADS_RETENTION_DAYS < 1:
+        raise ConfigError("ADS_RETENTION_DAYS должен быть >= 1")
+    if len(ADS_FAMILY_NAME) > 100:
+        raise ConfigError("ADS_FAMILY_NAME не может быть длиннее 100 символов")
     if MAX_SHIFT_DURATION_HOURS < 1:
         raise ConfigError("MAX_SHIFT_DURATION_HOURS должен быть >= 1")
     if MAX_SHIFT_SLOTS < 1:

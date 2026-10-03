@@ -289,7 +289,7 @@ def test_legacy_database_migration_with_existing_rows():
         backup_paths = []
         try:
             await reset_database(path)
-            backup_paths = list(Path(path).parent.glob(Path(path).name + ".pre_v4_*.db"))
+            backup_paths = list(Path(path).parent.glob(Path(path).name + ".pre_v6_*.db"))
             assert len(backup_paths) == 1
             member_columns = {row["name"] for row in await db.fetchall("PRAGMA table_info(shift_members)")}
             notification_columns = {row["name"] for row in await db.fetchall("PRAGMA table_info(notifications)")}
@@ -317,7 +317,7 @@ def test_legacy_database_migration_with_existing_rows():
             assert "idx_notifications_status" in indexes
             assert "idx_shift_members_actual_start" in indexes
             version = await db.fetchone("PRAGMA user_version")
-            assert version[0] == 4
+            assert version[0] == 6
 
             # New rows in columns added to a populated legacy table must still
             # receive timestamps via migration triggers.
@@ -952,14 +952,14 @@ def test_v2_to_v4_migration_preserves_existing_report_and_invite_rows():
         backups = []
         try:
             await reset_database(path)
-            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v4_*.db"))
+            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v6_*.db"))
             assert len(backups) == 1
             report = await db.fetchone("SELECT id, user_id, total_accepted, message_id FROM shift_reports WHERE id=7")
             invite = await db.fetchone("SELECT id, user_id, static_id, full_name, message_id FROM invites WHERE id=8")
             assert dict(report) == {"id": 7, "user_id": 501, "total_accepted": 4, "message_id": None}
             assert dict(invite) == {"id": 8, "user_id": 777, "static_id": "777", "full_name": "Old Invite", "message_id": None}
             version = await db.fetchone("PRAGMA user_version")
-            assert version[0] == 4
+            assert version[0] == 6
         finally:
             await db.close()
             if os.path.exists(path):
@@ -1248,14 +1248,14 @@ def test_v3_to_v4_migration_creates_blacklist_without_losing_data():
         backups = []
         try:
             await reset_database(path)
-            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v4_*.db"))
+            backups = list(Path(path).parent.glob(Path(path).name + ".pre_v6_*.db"))
             assert len(backups) == 1
             old = await db.fetchone("SELECT username, static_id FROM users WHERE discord_id=77")
             assert dict(old) == {"username": "before-v4", "static_id": "77"}
             tables = {row["name"] for row in await db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")}
             assert "blacklist" in tables
             version = await db.fetchone("PRAGMA user_version")
-            assert version[0] == 4
+            assert version[0] == 6
         finally:
             await db.close()
             if os.path.exists(path): os.remove(path)

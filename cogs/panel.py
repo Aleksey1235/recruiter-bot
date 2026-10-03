@@ -46,7 +46,7 @@ def _panel_embed() -> disnake.Embed:
     )
     embed.add_field(
         name="👥 Рекрутинг",
-        value="Инвайты • профиль • статистика • финансы • цели",
+        value="Инвайты • профиль • статистика • финансы • цели • реклама",
         inline=False,
     )
     embed.add_field(
@@ -84,6 +84,8 @@ async def _profile_embed(member) -> disnake.Embed:
     embed.add_field(name="👥 Инвайтов", value=str(invites["count"] or 0), inline=True)
     embed.add_field(name="💰 Начислено", value=money(accrued), inline=True)
     embed.add_field(name="📊 К выплате", value=money(available), inline=True)
+    from cogs.advertising import add_summary_field
+    await add_summary_field(embed, member.id, "всё время")
     return embed
 
 
@@ -111,7 +113,7 @@ async def _finance_embed(user_id: int, title: str = "💰 МОИ ФИНАНСЫ"
 
 
 async def _goals_embed(user_id: int) -> disnake.Embed:
-    type_labels = {"люди": "👥 Люди", "смены": "📋 Смены", "часы": "⏱ Часы"}
+    type_labels = {"люди": "👥 Люди", "смены": "📋 Смены", "часы": "⏱ Часы", "рекламы": "📢 Рекламы"}
     period_labels = {"день": "за сегодня", "неделя": "за неделю", "месяц": "за месяц"}
     goals = await db.fetchall(
         "SELECT * FROM goals WHERE user_id=? AND status='active' ORDER BY id",
@@ -189,6 +191,8 @@ async def _stats_embed(member, period: str) -> disnake.Embed:
         inline=True,
     )
     embed.add_field(name="⭐ РЕЙТИНГ", value=f"Место: #{data['rank']}" if data["rank"] else "Нет места", inline=True)
+    from cogs.advertising import add_summary_field
+    await add_summary_field(embed, member.id, period=period)
     return embed
 
 
@@ -1327,6 +1331,7 @@ class GoalTypeSelect(disnake.ui.StringSelect):
                 disnake.SelectOption(label="Люди", value="люди", emoji="👥"),
                 disnake.SelectOption(label="Смены", value="смены", emoji="📋"),
                 disnake.SelectOption(label="Часы", value="часы", emoji="⏱️"),
+                disnake.SelectOption(label="Рекламы", value="рекламы", emoji="📢"),
             ],
             min_values=1,
             max_values=1,
@@ -2001,6 +2006,18 @@ class MainPanelView(disnake.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
+    async def interaction_check(self, inter):
+        if not inter.guild or inter.guild.id != config.GUILD_ID or not is_recruiter_or_higher(inter.author):
+            await inter.response.send_message("❌ Панель доступна рекрутерам и старшему составу.", ephemeral=True)
+            return False
+        try:
+            await ensure_user(inter.author.id, username=inter.author.name)
+        except Exception:
+            logger.exception("Не удалось создать профиль при открытии панели")
+            await inter.response.send_message("❌ Не удалось открыть профиль. Сообщите администратору.", ephemeral=True)
+            return False
+        return True
+
     async def _recruiter_check(self, inter) -> bool:
         if not is_recruiter_or_higher(inter.author):
             await inter.response.send_message("❌ Панель доступна рекрутерам и старшему составу.", ephemeral=True)
@@ -2080,11 +2097,17 @@ class MainPanelView(disnake.ui.View):
         embed.description = (
             "**Смена** — начать, завершить, выйти, расписание, исправление отчёта.\n"
             "**Профиль / Статистика / Финансы / Цели / Инвайты** — личная работа рекрутера.\n"
+            "**Реклама** — подача, случайное фото-подтверждение и статистика рекламы DeSanta.\n"
             "**Руководство** — смены, отчёты, инвайты, статистика, цели и заметки.\n"
             "**Админ** — диагностика, логи, бэкап, деньги и база.\n\n"
             "Slash-команды сохранены как резервный способ, но для обычной работы они не нужны."
         )
         await inter.response.send_message(embed=embed, ephemeral=True)
+
+    @disnake.ui.button(label="📢 Реклама", style=disnake.ButtonStyle.primary, custom_id="panel:ads", row=2)
+    async def ads(self, button, inter):
+        from cogs.advertising import show_advertising_menu
+        await show_advertising_menu(inter)
 
 
 class Panel(commands.Cog):

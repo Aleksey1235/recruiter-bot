@@ -111,6 +111,7 @@ async def main():
         "cogs.admin",
         "cogs.database_admin",
         "cogs.panel",
+        "cogs.advertising",
         "cogs.tasks",
         "cogs.help",
     ]

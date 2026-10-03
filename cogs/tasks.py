@@ -276,6 +276,8 @@ class Tasks(commands.Cog):
                 ),
                 inline=False,
             )
+            from cogs.advertising import add_summary_field
+            await add_summary_field(embed, None, start=week_start, end=week_end)
             await channel.send(embed=embed)
         except Exception as exc:
             await finish_system_marker("WEEKLY_REPORT", "week", marker, False, str(exc))

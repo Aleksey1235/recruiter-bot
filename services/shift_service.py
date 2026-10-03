@@ -122,11 +122,13 @@ async def set_shift_message_id(shift_id: int, message_id: int):
 async def set_report_message_id(report_id: int, message_id: int | None):
     await db.execute("UPDATE shift_reports SET message_id=? WHERE id=?", (message_id, report_id))
 
-async def take_shift(shift_id: int, user_id: int, username: str, static_id: str):
-    static_id = static_id.strip()
-    if not static_id:
+async def take_shift(shift_id: int, user_id: int, username: str, static_id: str | None = None):
+    # UI больше не запрашивает статик. Явное значение поддерживается для
+    # совместимости сервисных вызовов, но не заменяет существующий профиль.
+    static_id = static_id.strip() if static_id is not None else None
+    if static_id is not None and not static_id:
         raise UserFacingError("Укажите статик.")
-    if len(static_id) > config.MAX_STATIC_ID_LENGTH:
+    if static_id is not None and len(static_id) > config.MAX_STATIC_ID_LENGTH:
         raise UserFacingError(f"Статик не может быть длиннее {config.MAX_STATIC_ID_LENGTH} символов.")
 
     async with db.transaction() as tx:
@@ -144,6 +146,8 @@ async def take_shift(shift_id: int, user_id: int, username: str, static_id: str)
             raise UserFacingError("Запись на смену закрывается в момент её начала. Попросите старший состав помочь, если нужно присоединиться позже.")
 
         profile = await tx.fetchone("SELECT static_id FROM users WHERE discord_id=?", (user_id,))
+        if static_id is None:
+            static_id = profile["static_id"] if profile else None
         if profile and profile["static_id"] and profile["static_id"] != static_id:
             raise UserFacingError(
                 f"В вашем профиле уже указан статик {profile['static_id']}. "
@@ -234,7 +238,7 @@ async def take_shift(shift_id: int, user_id: int, username: str, static_id: str)
         # Не затираем статус active, если один из участников уже начал работу.
         # Свободные места и жизненный цикл смены — разные вещи.
         await _recalculate_shift_status(tx, shift_id)
-        await log(user_id, "SHIFT_TAKEN", "shift", shift_id, f"Статик: {static_id}", tx=tx)
+        await log(user_id, "SHIFT_TAKEN", "shift", shift_id, f"Статик: {static_id or '—'}", tx=tx)
         return member_id
 
 
