@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-wal
+*.db-shm
+bot.log
+bot.log.*
+.DS_Store

@@ -1,8 +1,10 @@
-Recruiter Bot — Production Ultimate Audited
-Build date: 2026-08-25
-Database schema: v4
+Recruiter Bot v6 — DeSanta / ECLIPSE
+Build date: 2026-10-03
+Base build: 2026-08-25 Production Ultimate
+Database schema: v6
 Python target: 3.11
-Timezone default: Europe/Moscow
-Test suite: 65 passed × 3 consecutive runs
-Primary UI: buttons + slash fallback
-Blacklist management: Admin only
+Primary UI: buttons; FileUpload modal for advertising evidence
+Advertising defaults: 20% proof, 3-minute interval, 90-day reviewed-photo retention
+Advertising integration: all-time profile, weekly report, day/week/month goals
+Tests: 108 passed, Python 3.11.17, real disnake 2.12.1 / aiosqlite 0.22.1
+Live Discord / production host: not accessed
