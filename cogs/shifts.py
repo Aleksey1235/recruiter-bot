@@ -162,7 +162,7 @@ class FinishShiftModal(disnake.ui.Modal):
         )
 
     async def callback(self, inter: disnake.ModalInteraction):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             total = int(inter.text_values["total"].strip())
             base = int(inter.text_values["base"].strip())
@@ -242,7 +242,7 @@ class ResubmitReportModal(disnake.ui.Modal):
         )
 
     async def callback(self, inter: disnake.ModalInteraction):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             total = int(inter.text_values["total"].strip())
             base = int(inter.text_values["base"].strip())
@@ -318,7 +318,7 @@ class RejectReportModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         if not is_senior_or_admin(inter.author):
             return await inter.response.send_message("❌ Недостаточно прав.", ephemeral=True)
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         reason = inter.text_values["reason"]
         try:
             report = await shift_service.reject_report(self.report_id, inter.author.id, reason)
@@ -338,6 +338,12 @@ class RejectReportModal(disnake.ui.Modal):
         if warnings:
             text += "\n⚠️ " + "; ".join(warnings) + ". Данные в БД сохранены."
         await inter.edit_original_response(content=text)
+
+
+def _has_private_booking_response(message) -> bool:
+    return (getattr(message, "content", "") or "").startswith((
+        "❌ ", "✅ Вы записались на смену",
+    ))
 
 
 async def update_shift_message(guild, shift_id: int) -> bool:
@@ -388,7 +394,10 @@ async def update_shift_message(guild, shift_id: int) -> bool:
 
     if message:
         try:
-            await message.edit(embed=embed, view=view)
+            # Remove a leaked v6 booking result, while preserving normal role
+            # mentions and leaving the public roster/status update intact.
+            repair = {"content": None} if _has_private_booking_response(message) else {}
+            await message.edit(embed=embed, view=view, **repair)
             return True
         except Exception:
             logger.exception("Не удалось обновить сообщение смены #%s", shift_id)
@@ -457,6 +466,36 @@ async def sync_report_review_message(guild, report_id: int, approved: bool, revi
 class Shifts(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._booking_cards_restored = False
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._booking_cards_restored:
+            return
+        guild = self.bot.get_guild(config.GUILD_ID)
+        channel = guild.get_channel(config.SHIFTS_CHANNEL_ID) if guild else None
+        if channel is None:
+            return
+        try:
+            async for message in channel.history(limit=200):
+                if message.author.id != self.bot.user.id or not _has_private_booking_response(message):
+                    continue
+                if not message.embeds or not message.embeds[0].footer:
+                    continue
+                footer = message.embeds[0].footer.text or ""
+                if not footer.startswith("Смена #"):
+                    continue
+                try:
+                    shift_id = int(footer.removeprefix("Смена #"))
+                except ValueError:
+                    continue
+                row = await db.fetchone("SELECT message_id FROM shifts WHERE id=?", (shift_id,))
+                if row and row["message_id"] == message.id:
+                    if not await update_shift_message(guild, shift_id):
+                        raise RuntimeError(f"Не удалось восстановить карточку смены #{shift_id}")
+            self._booking_cards_restored = True
+        except Exception:
+            logger.exception("Не удалось очистить личные ответы на старых карточках смен")
 
     @commands.Cog.listener()
     async def on_button_click(self, inter: disnake.MessageInteraction):
@@ -473,7 +512,7 @@ class Shifts(commands.Cog):
                     shift_id = int(custom_id.rsplit(":", 1)[1])
             except (ValueError, IndexError, AttributeError):
                 return await inter.response.send_message("❌ Не удалось определить ID смены.", ephemeral=True)
-            await inter.response.defer(ephemeral=True)
+            await inter.response.defer(ephemeral=True, with_message=True)
             try:
                 await shift_service.take_shift(shift_id, inter.author.id, inter.author.name)
             except UserFacingError as exc:
@@ -508,7 +547,7 @@ class Shifts(commands.Cog):
                     report_id = int(custom_id.rsplit(":", 1)[1])
             except (ValueError, IndexError, AttributeError):
                 return await inter.response.send_message("❌ Не удалось определить ID отчёта.", ephemeral=True)
-            await inter.response.defer(ephemeral=True)
+            await inter.response.defer(ephemeral=True, with_message=True)
             try:
                 report = await shift_service.approve_report(report_id, inter.author.id)
             except UserFacingError as exc:
@@ -555,7 +594,7 @@ class Shifts(commands.Cog):
         места: int = 1,
         описание: str = "",
     ):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             start = datetime.strptime(f"{дата} {начало}", "%d.%m.%Y %H:%M")
             end = datetime.strptime(f"{дата} {конец}", "%d.%m.%Y %H:%M")
@@ -592,7 +631,7 @@ class Shifts(commands.Cog):
     @shift.sub_command(name="выйти", description="Отказаться от забронированной смены")
     @is_recruiter()
     async def leave_shift_command(self, inter, смена: int = None, причина: str = "Личные обстоятельства"):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             shift_id = await shift_service.leave_shift(inter.author.id, смена, причина)
         except UserFacingError as exc:
@@ -603,7 +642,7 @@ class Shifts(commands.Cog):
     @shift.sub_command(name="начать", description="Начать свою ближайшую смену")
     @is_recruiter()
     async def start_shift(self, inter):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             member = await shift_service.find_shift_to_start(inter.author.id)
             shift_id = await shift_service.start_shift(member["id"], inter.author.id)
@@ -634,7 +673,7 @@ class Shifts(commands.Cog):
     @shift.sub_command(name="одобрить", description="Одобрить отчёт по ID (резервный способ)")
     @is_senior()
     async def approve_report_command(self, inter, отчёт: int):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             report = await shift_service.approve_report(отчёт, inter.author.id)
         except UserFacingError as exc:
@@ -654,7 +693,7 @@ class Shifts(commands.Cog):
     @shift.sub_command(name="отклонить", description="Отклонить отчёт по ID (резервный способ)")
     @is_senior()
     async def reject_report_command(self, inter, отчёт: int, причина: str):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             report = await shift_service.reject_report(отчёт, inter.author.id, причина)
         except UserFacingError as exc:
@@ -680,7 +719,7 @@ class Shifts(commands.Cog):
         причина: str,
         смена: int = None,
     ):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             shift_id = await shift_service.remove_member(
                 inter.author.id, пользователь.id, причина, shift_id=смена
@@ -706,7 +745,7 @@ class Shifts(commands.Cog):
     @shift.sub_command(name="отменить", description="Отменить смену целиком")
     @is_senior()
     async def cancel_shift(self, inter, смена: int, причина: str):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         try:
             members = await shift_service.cancel_shift(inter.author.id, смена, причина)
         except UserFacingError as exc:
@@ -724,7 +763,7 @@ class Shifts(commands.Cog):
     @shift.sub_command(name="расписание", description="Показать расписание на сегодня")
     @is_recruiter()
     async def schedule(self, inter):
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, with_message=True)
         now = local_now()
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1)
